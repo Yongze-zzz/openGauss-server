@@ -1,0 +1,24 @@
+DROP FUNCTION IF EXISTS pg_catalog.query_parameterization_views
+    (
+    out reloid oid,
+    out query_type text,
+    out is_bypass bool,
+    out param_types int2vector,
+    out param_nums smallint,
+    out parameterized_query text
+    ) CASCADE;
+
+do $$
+DECLARE
+ans boolean;
+BEGIN
+    IF working_version_num() >= 93000 then
+        for ans in select case when count(*)=1 then true else false end as ans from (select extname FROM pg_catalog.pg_extension where extname='shark')
+        LOOP
+            if ans = true then
+                ALTER EXTENSION shark UPDATE TO '1.0';
+            end if;
+            exit;
+        END LOOP;
+    END IF;
+END$$;

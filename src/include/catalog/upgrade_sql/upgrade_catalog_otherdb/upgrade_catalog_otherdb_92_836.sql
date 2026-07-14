@@ -1,0 +1,1 @@
+update pg_catalog.pg_proc set prokind = 'f' where oid = 3991;

@@ -1,0 +1,881 @@
+create schema test_d_ddl;
+set current_schema to test_d_ddl;
+-- test drop trigger
+create table animals (id int, name char(30));
+create table food (id int, foodtype varchar(32), remark varchar(32), time_flag timestamp);
+CREATE OR REPLACE FUNCTION insert_food_fun1 RETURNS TRIGGER AS
+$$
+BEGIN
+    insert into food(id, foodtype, remark, time_flag) values (1, 'bamboo', 'healthy', now());
+    RETURN NEW;
+END;
+$$ LANGUAGE PLPGSQL;
+CREATE TRIGGER animals_trigger1 AFTER INSERT ON animals
+FOR EACH ROW
+EXECUTE PROCEDURE insert_food_fun1();
+CREATE OR REPLACE FUNCTION insert_food_fun2 RETURNS TRIGGER AS
+$$
+BEGIN
+    insert into food(id, foodtype, remark, time_flag) values (2, 'water', 'healthy', now());
+    RETURN NEW;
+END;
+$$ LANGUAGE PLPGSQL;
+CREATE TRIGGER animals_trigger2 AFTER INSERT ON animals
+FOR EACH ROW
+EXECUTE PROCEDURE insert_food_fun2();
+select tgname from pg_trigger order by tgname;
+      tgname      
+------------------
+ animals_trigger1
+ animals_trigger2
+(2 rows)
+
+select count(*) from food;
+ count 
+-------
+     0
+(1 row)
+
+insert into animals(id, name) values (1, 'panda');
+select * from animals;
+ id |              name              
+----+--------------------------------
+  1 | panda                         
+(1 row)
+
+select count(*) from food;
+ count 
+-------
+     2
+(1 row)
+
+delete from animals;
+delete from food;
+drop trigger animals_trigger1;
+drop trigger if exists animals_trigger2;
+select tgname from pg_trigger;
+ tgname 
+--------
+(0 rows)
+
+-- test <>
+create table test1(id int, name varchar(10));
+insert into test1 values(1, 'test1');
+insert into test1 values(2, 'test2');
+select * from test1 where id <> 3;
+ id | name  
+----+-------
+  1 | test1
+  2 | test2
+(2 rows)
+
+select * from test1 where id < > 3;
+ id | name  
+----+-------
+  1 | test1
+  2 | test2
+(2 rows)
+
+select * from test1 where id <    > 3;
+ id | name  
+----+-------
+  1 | test1
+  2 | test2
+(2 rows)
+
+-- test nvarchar(max)
+create table test2(col1 int, col2 nvarchar(max), col3 nvarchar(50), col4 nvarchar,
+col5 nvarchar2(max), col6 nvarchar2(50), col7 nvarchar2);
+select * from information_schema.columns where table_name = 'test2' and table_schema = 'test_d_ddl' order by column_name;
+   table_catalog    | table_schema | table_name | column_name | ordinal_position | column_default | is_nullable | data_type | character_maximum_length | character_octet_length | numeric_precision | numeric_precision_radix | numeric_scale | datetime_precision | interval_type | interval_precision | character_set_catalog | character_set_schema | character_set_name | collation_catalog | collation_schema | collation_name | domain_catalog | domain_schema | domain_name |    udt_catalog     | udt_schema | udt_name  | scope_catalog | scope_schema | scope_name | maximum_cardinality | dtd_identifier | is_self_referencing | is_identity | identity_generation | identity_start | identity_increment | identity_maximum | identity_minimum | identity_cycle | is_generated | generation_expression | is_updatable | column_type | column_comment | extra |           privileges            | column_key | srs_id 
+--------------------+--------------+------------+-------------+------------------+----------------+-------------+-----------+--------------------------+------------------------+-------------------+-------------------------+---------------+--------------------+---------------+--------------------+-----------------------+----------------------+--------------------+-------------------+------------------+----------------+----------------+---------------+-------------+--------------------+------------+-----------+---------------+--------------+------------+---------------------+----------------+---------------------+-------------+---------------------+----------------+--------------------+------------------+------------------+----------------+--------------+-----------------------+--------------+-------------+----------------+-------+---------------------------------+------------+--------
+ contrib_regression | test_d_ddl   | test2      | col1        |                1 |                | YES         | integer   |                          |                        |                32 |                       2 |             0 |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | int4      |               |              |            |                     | 1              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | integer     |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col2        |                2 |                | YES         | nvarchar2 |                          |             1073741824 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 2              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col3        |                3 |                | YES         | nvarchar2 |                       50 |                    200 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 3              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col4        |                4 |                | YES         | nvarchar2 |                        1 |                      4 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 4              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col5        |                5 |                | YES         | nvarchar2 |                          |             1073741824 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 5              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col6        |                6 |                | YES         | nvarchar2 |                       50 |                    200 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 6              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+ contrib_regression | test_d_ddl   | test2      | col7        |                7 |                | YES         | nvarchar2 |                        1 |                      4 |                   |                         |               |                    |               |                    |                       |                      |                    |                   |                  |                |                |               |             | contrib_regression | pg_catalog | nvarchar2 |               |              |            |                     | 7              | NO                  | NO          |                     |                |                    |                  |                  |                | NEVER        |                       | YES          | nvarchar2   |                |       | select,insert,update,references |            |       
+(7 rows)
+
+insert into test2 values(1, 'abcd', 'abcd', 'a', 'abcd', 'abcd', 'a');
+select * from test2;
+ col1 | col2 | col3 | col4 | col5 | col6 | col7 
+------+------+------+------+------+------+------
+    1 | abcd | abcd | a    | abcd | abcd | a
+(1 row)
+
+insert into test2(col4) values('abcd'); --error, length is 1
+ERROR:  value too long for type nvarchar2(1)
+CONTEXT:  referenced column: col4
+insert into test2(col7) values('abcd'); --error, length is 1
+ERROR:  value too long for type nvarchar2(1)
+CONTEXT:  referenced column: col7
+create table test3(id nchar(max));
+ERROR:  max is only supported in nvarchar2 or varbinary type
+select '123'::nvarchar(max);
+ nvarchar2 
+-----------
+ 123
+(1 row)
+
+select '123'::nvarchar;
+ nvarchar2 
+-----------
+ 1
+(1 row)
+
+select '123'::nvarchar(1);
+ nvarchar2 
+-----------
+ 1
+(1 row)
+
+select '123'::nvarchar2(max);
+ nvarchar2 
+-----------
+ 123
+(1 row)
+
+select '123'::nvarchar2;
+ nvarchar2 
+-----------
+ 1
+(1 row)
+
+select '123'::nvarchar2(1);
+ nvarchar2 
+-----------
+ 1
+(1 row)
+
+select pg_typeof('123'::nvarchar2(max));
+ pg_typeof 
+-----------
+ nvarchar2
+(1 row)
+
+select pg_typeof('123'::nvarchar2);
+ pg_typeof 
+-----------
+ nvarchar2
+(1 row)
+
+select pg_typeof('123'::nvarchar2(1));
+ pg_typeof 
+-----------
+ nvarchar2
+(1 row)
+
+select pg_typeof('123'::nvarchar2(50));
+ pg_typeof 
+-----------
+ nvarchar2
+(1 row)
+
+create table test3(col1 nvarchar, col2 nvarchar(1), col3 nvarchar(50), col4 nvarchar(max));
+create table test4(col1 nvarchar2, col2 nvarchar2(1), col3 nvarchar2(50), col4 nvarchar2(max));
+\d test3
+      Table "test_d_ddl.test3"
+ Column |      Type      | Modifiers 
+--------+----------------+-----------
+ col1   | nvarchar2(1)   | 
+ col2   | nvarchar2(1)   | 
+ col3   | nvarchar2(50)  | 
+ col4   | nvarchar2(max) | 
+
+\d test4
+      Table "test_d_ddl.test4"
+ Column |      Type      | Modifiers 
+--------+----------------+-----------
+ col1   | nvarchar2(1)   | 
+ col2   | nvarchar2(1)   | 
+ col3   | nvarchar2(50)  | 
+ col4   | nvarchar2(max) | 
+
+\d+ test3
+                          Table "test_d_ddl.test3"
+ Column |      Type      | Modifiers | Storage  | Stats target | Description 
+--------+----------------+-----------+----------+--------------+-------------
+ col1   | nvarchar2(1)   |           | extended |              | 
+ col2   | nvarchar2(1)   |           | extended |              | 
+ col3   | nvarchar2(50)  |           | extended |              | 
+ col4   | nvarchar2(max) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+\d+ test4
+                          Table "test_d_ddl.test4"
+ Column |      Type      | Modifiers | Storage  | Stats target | Description 
+--------+----------------+-----------+----------+--------------+-------------
+ col1   | nvarchar2(1)   |           | extended |              | 
+ col2   | nvarchar2(1)   |           | extended |              | 
+ col3   | nvarchar2(50)  |           | extended |              | 
+ col4   | nvarchar2(max) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+select * from pg_get_tabledef('test3');
+             pg_get_tabledef             
+-----------------------------------------
+ SET search_path = test_d_ddl;          +
+ CREATE TABLE test3 (                   +
+     col1 nvarchar2(1),                 +
+     col2 nvarchar2(1),                 +
+     col3 nvarchar2(50),                +
+     col4 nvarchar2(max)                +
+ )                                      +
+ WITH (orientation=row, compression=no);
+(1 row)
+
+select * from pg_get_tabledef('test4');
+             pg_get_tabledef             
+-----------------------------------------
+ SET search_path = test_d_ddl;          +
+ CREATE TABLE test4 (                   +
+     col1 nvarchar2(1),                 +
+     col2 nvarchar2(1),                 +
+     col3 nvarchar2(50),                +
+     col4 nvarchar2(max)                +
+ )                                      +
+ WITH (orientation=row, compression=no);
+(1 row)
+
+create view view1 as select 'asdf'::nvarchar2(max);
+create view view2 as select 'asdf'::nvarchar2(max)::nvarchar;
+create view view3 as select 'asdf'::nvarchar2(max)::nvarchar(1);
+\d+ view1
+                     View "test_d_ddl.view1"
+  Column   |      Type      | Modifiers | Storage  | Description 
+-----------+----------------+-----------+----------+-------------
+ nvarchar2 | nvarchar2(max) |           | extended | 
+View definition:
+ SELECT 'asdf'::nvarchar2(max) AS "nvarchar2";
+
+\d+ view2
+                    View "test_d_ddl.view2"
+  Column   |     Type     | Modifiers | Storage  | Description 
+-----------+--------------+-----------+----------+-------------
+ nvarchar2 | nvarchar2(1) |           | extended | 
+View definition:
+ SELECT 'asdf'::nvarchar2(1) AS "nvarchar2";
+
+\d+ view3
+                    View "test_d_ddl.view3"
+  Column   |     Type     | Modifiers | Storage  | Description 
+-----------+--------------+-----------+----------+-------------
+ nvarchar2 | nvarchar2(1) |           | extended | 
+View definition:
+ SELECT 'asdf'::nvarchar2(1) AS "nvarchar2";
+
+select * from pg_get_viewdef('view1');
+                pg_get_viewdef                 
+-----------------------------------------------
+ SELECT 'asdf'::nvarchar2(max) AS "nvarchar2";
+(1 row)
+
+select * from pg_get_viewdef('view2');
+               pg_get_viewdef                
+---------------------------------------------
+ SELECT 'asdf'::nvarchar2(1) AS "nvarchar2";
+(1 row)
+
+select * from pg_get_viewdef('view3');
+               pg_get_viewdef                
+---------------------------------------------
+ SELECT 'asdf'::nvarchar2(1) AS "nvarchar2";
+(1 row)
+
+select * from view1;
+ nvarchar2 
+-----------
+ asdf
+(1 row)
+
+select * from view2;
+ nvarchar2 
+-----------
+ a
+(1 row)
+
+select * from view3;
+ nvarchar2 
+-----------
+ a
+(1 row)
+
+declare
+    output1 nvarchar(max);
+    output2 nvarchar(max);
+    output3 nvarchar(max);
+    output4 nvarchar(max);
+begin
+    create table case0005(col1 int, col2 nvarchar(max), col3 nvarchar(50), col4 nvarchar, col nvarchar2(max), col6 nvarchar2(50), col7 nvarchar2);
+    insert into case0005 values(1, 'abcd', 'abcd', 'a', 'abcd','abcd','a');
+    select col2 into output1 from case0005 where col1 = 1;
+    raise info 'INFO: output1 is %',output1;
+    select col4 into output2 from case0005 where col1 = 1;
+    raise info 'INFO: output2 is %',output2;
+    select col into output3 from case0005 where col1 = 1;
+    raise info 'INFO: output3 is %',output3;
+    select col7 into output4 from case0005 where col1 = 1;
+    raise info 'INFO: output4 is %',output4;
+END;
+/
+INFO:  INFO: output1 is abcd
+INFO:  INFO: output2 is a
+INFO:  INFO: output3 is abcd
+INFO:  INFO: output4 is a
+CREATE OR REPLACE FUNCTION test_case0001() RETURNS VOID AS
+$$
+DECLARE
+    output1 nvarchar(max);
+    output2 nvarchar(max);
+    output3 nvarchar(max);
+    output4 nvarchar(max);
+BEGIN
+    create table case0001(col1 int, col2 nvarchar(max), col3 nvarchar(50), col4 nvarchar, col nvarchar2(max), col6 nvarchar2(50), col7 nvarchar2);
+    insert into case0001 values(1, 'abcd', 'abcd', 'a', 'abcd','abcd','a');
+    select col2 into output1 from case0001 where col1 = 1;
+    raise info 'INFO: output1 is %',output1;
+    select col4 into output2 from case0001 where col1 = 1;
+    raise info 'INFO: output2 is %',output2;
+    select col into output3 from case0001 where col1 = 1;
+    raise info 'INFO: output3 is %',output3;
+    select col7 into output4 from case0001 where col1 = 1;
+    raise info 'INFO: output4 is %',output4;
+END;
+$$ LANGUAGE plpgsql;
+select test_case0001();
+INFO:  INFO: output1 is abcd
+CONTEXT:  referenced column: test_case0001
+INFO:  INFO: output2 is a
+CONTEXT:  referenced column: test_case0001
+INFO:  INFO: output3 is abcd
+CONTEXT:  referenced column: test_case0001
+INFO:  INFO: output4 is a
+CONTEXT:  referenced column: test_case0001
+ test_case0001 
+---------------
+ 
+(1 row)
+
+declare
+    output1 nvarchar(max);
+    output2 nvarchar2(max);
+begin
+END;
+/
+select null::nvarchar(max);
+ nvarchar2 
+-----------
+ 
+(1 row)
+
+select null::nvarchar2(max);
+ nvarchar2 
+-----------
+ 
+(1 row)
+
+set d_format_behavior_compat_options = 'enable_sbr_identifier';
+drop table if exists t1;
+NOTICE:  table "t1" does not exist, skipping
+CREATE TABLE t1(id [int]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | integer |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [int2]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |   Type   | Modifiers | Storage | Stats target | Description 
+--------+----------+-----------+---------+--------------+-------------
+ id     | smallint |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [int4]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | integer |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [int8]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column |  Type  | Modifiers | Storage | Stats target | Description 
+--------+--------+-----------+---------+--------------+-------------
+ id     | bigint |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [tinyint]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | tinyint |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [smallint]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |   Type   | Modifiers | Storage | Stats target | Description 
+--------+----------+-----------+---------+--------------+-------------
+ id     | smallint |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [bigint]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column |  Type  | Modifiers | Storage | Stats target | Description 
+--------+--------+-----------+---------+--------------+-------------
+ id     | bigint |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [binary_integer]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | integer |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [float]);
+\d+ t1
+                            Table "test_d_ddl.t1"
+ Column |       Type       | Modifiers | Storage | Stats target | Description 
+--------+------------------+-----------+---------+--------------+-------------
+ id     | double precision |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [float4]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | real |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [real]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | real |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [float8]);
+\d+ t1
+                            Table "test_d_ddl.t1"
+ Column |       Type       | Modifiers | Storage | Stats target | Description 
+--------+------------------+-----------+---------+--------------+-------------
+ id     | double precision |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [double precision]);
+\d+ t1
+                            Table "test_d_ddl.t1"
+ Column |       Type       | Modifiers | Storage | Stats target | Description 
+--------+------------------+-----------+---------+--------------+-------------
+ id     | double precision |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [binary_double]);
+\d+ t1
+                            Table "test_d_ddl.t1"
+ Column |       Type       | Modifiers | Storage | Stats target | Description 
+--------+------------------+-----------+---------+--------------+-------------
+ id     | double precision |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [numeric]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | numeric |           | main    |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [decimal]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | numeric |           | main    |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [dec]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | numeric |           | main    |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [bpchar]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type  | Modifiers | Storage  | Stats target | Description 
+--------+--------+-----------+----------+--------------+-------------
+ id     | bpchar |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [char]);
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type     | Modifiers | Storage  | Stats target | Description 
+--------+--------------+-----------+----------+--------------+-------------
+ id     | character(1) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [char](30));
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type      | Modifiers | Storage  | Stats target | Description 
+--------+---------------+-----------+----------+--------------+-------------
+ id     | character(30) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [varchar]);
+\d+ t1
+                             Table "test_d_ddl.t1"
+ Column |       Type        | Modifiers | Storage  | Stats target | Description 
+--------+-------------------+-----------+----------+--------------+-------------
+ id     | character varying |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [varchar](30));
+\d+ t1
+                               Table "test_d_ddl.t1"
+ Column |         Type          | Modifiers | Storage  | Stats target | Description 
+--------+-----------------------+-----------+----------+--------------+-------------
+ id     | character varying(30) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [nvarchar2]);
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type     | Modifiers | Storage  | Stats target | Description 
+--------+--------------+-----------+----------+--------------+-------------
+ id     | nvarchar2(1) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [nvarchar2](30));
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type      | Modifiers | Storage  | Stats target | Description 
+--------+---------------+-----------+----------+--------------+-------------
+ id     | nvarchar2(30) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [nvarchar]);
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type     | Modifiers | Storage  | Stats target | Description 
+--------+--------------+-----------+----------+--------------+-------------
+ id     | nvarchar2(1) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [nvarchar](30));
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type      | Modifiers | Storage  | Stats target | Description 
+--------+---------------+-----------+----------+--------------+-------------
+ id     | nvarchar2(30) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [abstime]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | abstime |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [reltime]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | reltime |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [date]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | date |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [time]);
+\d+ t1
+                               Table "test_d_ddl.t1"
+ Column |          Type          | Modifiers | Storage | Stats target | Description 
+--------+------------------------+-----------+---------+--------------+-------------
+ id     | time without time zone |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [timestamptz]);
+\d+ t1
+                                Table "test_d_ddl.t1"
+ Column |           Type           | Modifiers | Storage | Stats target | Description 
+--------+--------------------------+-----------+---------+--------------+-------------
+ id     | timestamp with time zone |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [timestamp]);
+\d+ t1
+                                  Table "test_d_ddl.t1"
+ Column |            Type             | Modifiers | Storage | Stats target | Description 
+--------+-----------------------------+-----------+---------+--------------+-------------
+ id     | timestamp without time zone |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [timetz]);
+\d+ t1
+                              Table "test_d_ddl.t1"
+ Column |        Type         | Modifiers | Storage | Stats target | Description 
+--------+---------------------+-----------+---------+--------------+-------------
+ id     | time with time zone |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [bit]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type  | Modifiers | Storage  | Stats target | Description 
+--------+-------+-----------+----------+--------------+-------------
+ id     | "bit" |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [interval]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |   Type   | Modifiers | Storage | Stats target | Description 
+--------+----------+-----------+---------+--------------+-------------
+ id     | interval |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [uuid]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | uuid |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [bool]);
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | boolean |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [json]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage  | Stats target | Description 
+--------+------+-----------+----------+--------------+-------------
+ id     | json |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [unknown]);
+WARNING:  column "id" has type "unknown"
+DETAIL:  Proceeding with relation creation anyway.
+\d+ t1
+                        Table "test_d_ddl.t1"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ id     | unknown |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [jsonb]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type  | Modifiers | Storage  | Stats target | Description 
+--------+-------+-----------+----------+--------------+-------------
+ id     | jsonb |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [clob]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage  | Stats target | Description 
+--------+------+-----------+----------+--------------+-------------
+ id     | clob |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [blob]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage  | Stats target | Description 
+--------+------+-----------+----------+--------------+-------------
+ id     | blob |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [money]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type  | Modifiers | Storage | Stats target | Description 
+--------+-------+-----------+---------+--------------+-------------
+ id     | money |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [name]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | name |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [oid]);
+\d+ t1
+                      Table "test_d_ddl.t1"
+ Column | Type | Modifiers | Storage | Stats target | Description 
+--------+------+-----------+---------+--------------+-------------
+ id     | oid  |           | plain   |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [bytea]);
+\d+ t1
+                       Table "test_d_ddl.t1"
+ Column | Type  | Modifiers | Storage  | Stats target | Description 
+--------+-------+-----------+----------+--------------+-------------
+ id     | bytea |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [varbinary]);
+\d+ t1
+                           Table "test_d_ddl.t1"
+ Column |     Type     | Modifiers | Storage  | Stats target | Description 
+--------+--------------+-----------+----------+--------------+-------------
+ id     | varbinary(1) |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+CREATE TABLE t1(id [sql_variant]);
+\d+ t1
+                          Table "test_d_ddl.t1"
+ Column |    Type     | Modifiers | Storage  | Stats target | Description 
+--------+-------------+-----------+----------+--------------+-------------
+ id     | sql_variant |           | extended |              | 
+Has OIDs: no
+Options: orientation=row, compression=no
+
+drop table t1;
+drop schema test_d_ddl cascade;
+NOTICE:  drop cascades to 14 other objects
+DETAIL:  drop cascades to table animals
+drop cascades to table food
+drop cascades to function insert_food_fun1()
+drop cascades to function insert_food_fun2()
+drop cascades to table test1
+drop cascades to table test2
+drop cascades to table test3
+drop cascades to table test4
+drop cascades to view view1
+drop cascades to view view2
+drop cascades to view view3
+drop cascades to table case0005
+drop cascades to function test_case0001()
+drop cascades to table case0001

@@ -1,0 +1,1 @@
+/home/yanyz/olap/openGauss-server/./src/gausskernel/storage/access/rmgrdesc/replorigindesc.cpp
