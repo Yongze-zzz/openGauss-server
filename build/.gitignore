@@ -1,3 +1,6 @@
 *
 !.gitignore
 !script/
+!script/**
+script/*.log
+script/version.cfg
