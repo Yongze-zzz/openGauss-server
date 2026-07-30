@@ -228,7 +228,6 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "utils/memprot.h"
-#include "vecexecutor/vecexecutor.h"
 #include "pgstat.h"
 #include "storage/matrix_mem.h"
 #include "storage/wd_agg_wrapper.h"
@@ -10278,8 +10277,6 @@ void ExitPostmaster(int status)
     MatrixMemFuncUnInit();
     UadkAggFuncUnInit();
 #endif
-
-    VecCacheTraceDumpGlobal();
 
     // flush stdout buffer before _exit
     //

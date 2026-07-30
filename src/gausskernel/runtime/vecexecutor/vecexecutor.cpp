@@ -165,6 +165,9 @@ VectorBatch* VectorEngine(PlanState* node)
 #endif
     Assert(node->vectorized);
 
+    // Track this node from executor setup through instrumentation teardown.
+    VecCacheTraceEnter(node);
+
     if (node->nodeContext) {
         old_context = MemoryContextSwitchTo(node->nodeContext);
     }
@@ -180,13 +183,9 @@ VectorBatch* VectorEngine(PlanState* node)
     //     vec_engine_profile_start = VecEngineProfileEnter(node, &vec_engine_profile_depth, &vec_engine_profile_cpu);
     // }
 
-    //add cache trace function
-    VecCacheTraceEnter(node);
     t_thrd.pgxc_cxt.GlobalNetInstr = node->instrument;
     result = VectorEngineRunner[GetRunnerIdx(nodeTag(node))](node);
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
-    //add cache trace function
-    VecCacheTraceLeave(node, result);
 
     // if (unlikely(vec_engine_profile)) {
     //     VecEngineProfileLeave(node, result, vec_engine_profile_start, vec_engine_profile_depth, vec_engine_profile_cpu);
@@ -231,6 +230,8 @@ VectorBatch* VectorEngine(PlanState* node)
     if (old_context) {
         (void)MemoryContextSwitchTo(old_context);
     }
+
+    VecCacheTraceLeave(node);
     return result;
 }
 

@@ -1045,7 +1045,6 @@ typedef struct knl_g_shmem_context {
 
 typedef struct knl_g_executor_context {
     HTAB* function_id_hashtbl;
-    void* cache_trace;
 #ifndef ENABLE_MULTIPLE_NODES
     char* nodeName;
     char* global_application_name;

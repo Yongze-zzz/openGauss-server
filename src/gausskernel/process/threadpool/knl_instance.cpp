@@ -579,7 +579,6 @@ static void knl_g_listen_sock_init(knl_g_listen_context* listen_sock_cxt)
 static void knl_g_executor_init(knl_g_executor_context* exec_cxt)
 {
     exec_cxt->function_id_hashtbl = NULL;
-    exec_cxt->cache_trace = NULL;
 #ifndef ENABLE_MULTIPLE_NODES
     exec_cxt->nodeName = "Local Node";
     exec_cxt->global_application_name = "";
