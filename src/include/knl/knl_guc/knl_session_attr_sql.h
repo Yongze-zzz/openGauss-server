@@ -66,6 +66,10 @@ typedef struct knl_session_attr_sql {
     bool force_bitmapand;
     #ifdef ENABLE_HTAP
     bool enable_imcsscan;
+    bool enable_imcs_partition_scan;
+    bool enable_numa_aware_partition_scan;
+    char* imcs_partition_scan_cpus;
+    char* imcs_partition_numa_map;
     #endif
     bool enable_bm25_taat;
     bool enable_union_all_subquery_orderby;

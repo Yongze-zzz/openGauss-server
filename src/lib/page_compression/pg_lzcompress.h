@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/include/utils/pg_lzcompress.h
+/mnt/nvme1p1/yanyz/openGauss-server/./src/include/utils/pg_lzcompress.h

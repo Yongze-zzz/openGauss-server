@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/gausskernel/storage/access/rmgrdesc/genericdesc.cpp
+/mnt/nvme1p1/yanyz/openGauss-server/./src/gausskernel/storage/access/rmgrdesc/genericdesc.cpp

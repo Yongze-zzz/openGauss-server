@@ -259,7 +259,8 @@ struct IMCSDesc {
     bool populateInShareMem;
     ShareMemoryPool* shareMemPool;
     bool isShmNotEnough;
-
+    /* -1: native allocation; otherwise the node selected before populate. */
+    int dataNumaNode;
     BorrowMemPool* borrowMemPool;
 
     IMCSDesc();
@@ -399,6 +400,10 @@ public:
     int shmChunkNumber;
     uint32 shmCUOffset;
     IMCSDesc* imcsDesc;
+    /* One page-isolated mapping contains the persistent source and offset buffers. */
+    void* m_partitionWiseBuffer;
+    Size m_partitionWiseBufferSize;
+    void FreePartitionWiseBuffer();
 #endif
 
 public:
@@ -609,6 +614,9 @@ ScalarValue CU::GetValue(int rowIdx)
 template <bool freeByCUCacheMgr>
 void CU::FreeMem()
 {
+#ifdef ENABLE_HTAP
+    FreePartitionWiseBuffer();
+#endif
     if (this->m_srcBuf) {
 #ifdef ENABLE_HTAP
         /* this->shmCUOffset of ss imcstore is more than 0 */

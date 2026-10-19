@@ -256,7 +256,7 @@ typedef struct CStoreScanState : ScanState {
     TableScanDesc ss_currentDeltaScanDesc;
     bool ss_deltaScan;
     bool ss_deltaScanEnd;
-    bool partitionLaneScan;
+    bool partitionWiseScan; /* One worker scans the entire current partition. */
 
     VectorBatch* m_pScanBatch;     // batch to work on
     VectorBatch* m_pCurrentBatch;  // output batch
@@ -406,6 +406,7 @@ struct VecNestLoopState : public NestLoopState {
 };
 
 typedef struct VecPartIteratorState : public PartIteratorState {
+    int* partitionWiseWorkers; /* NUMA assignment by partition-list position; unused by plain partition scans. */
 } VecPartIteratorState;
 
 class BatchStore;

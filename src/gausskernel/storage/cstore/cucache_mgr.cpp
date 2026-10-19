@@ -28,7 +28,9 @@
 #include "storage/ipc.h"
 #include "miscadmin.h"
 #include "pgxc/pgxc.h"
-
+#ifdef ENABLE_HTAP
+#include "access/htap/imcs_partition_wise.h"
+#endif
 // FUTURE CASE: cstore_buffers and CUCacheMode should be tunable
 int CUCacheMode = 1;
 
@@ -523,6 +525,9 @@ CUUncompressedRetCode DataCacheMgr::StartUncompressCU(
     } else {
         cuPtr->UnCompress(cuDescPtr->row_count, cuDescPtr->magic, align_size);
     }
+    /* Restore the same physical layout after eviction/reload, under the CU lock. */
+   if (cuPtr->imcsDesc != NULL)
+       ImcsPartitionWisePlaceCU(cuPtr, cuPtr->imcsDesc->dataNumaNode);
 #else
     cuPtr->UnCompress(cuDescPtr->row_count, cuDescPtr->magic, align_size);
 #endif

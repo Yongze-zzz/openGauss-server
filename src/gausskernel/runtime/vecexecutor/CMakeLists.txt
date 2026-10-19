@@ -2,11 +2,9 @@
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR} TGT_vecexecutor_SRC)
 list(REMOVE_ITEM TGT_vecexecutor_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/vec_cache_trace.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/vec_engine_profile.cpp
 )
 list(APPEND TGT_vecexecutor_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/vec_cache_trace.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/vec_engine_profile.cpp
 )
 
 set(TGT_vecexecutor_INC 

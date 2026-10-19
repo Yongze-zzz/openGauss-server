@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/common/port/pg_bitutils.cpp
+/mnt/nvme1p1/yanyz/openGauss-server/./src/common/port/pg_bitutils.cpp

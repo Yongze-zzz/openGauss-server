@@ -62,7 +62,7 @@
  */
 #include "parser/gramparse.h"
 #include "shark.h" /** END OF include: scan-tsql-prologue-top.l.h **/
-#line 35 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 35 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 
 #include "postgres.h"
 #include "knl/knl_variable.h"
@@ -288,7 +288,7 @@ const alias_names alias_list[ALIAS_LIST_LEN] = {
     {"char", CHAR_P}
 #line 92 "scan-tsql-prologue.l.h"
 }; /** END OF include: scan-tsql-prologue.l.h **/
-#line 149 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 149 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 %}
 
 %option reentrant
@@ -839,12 +839,12 @@ tsql_ttname  \#?\#{tsql_name}*
  /** END OF include: scan-tsql-rule.l **/
 
 {whitespace_only}	{
-#line 452 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 452 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					/* ignore */
 				}
 
 {comment}		{
-#line 456 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 456 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					if (yyextra->include_ora_comment)
 					{
 						SET_YYLLOC();
@@ -856,7 +856,7 @@ tsql_ttname  \#?\#{tsql_name}*
 				}
 
 {xcstart}	{
-#line 467 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 467 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					/* Set location in case of syntax error in comment */
 					SET_YYLLOC();
 					yyextra->xcdepth = 0;
@@ -871,7 +871,7 @@ tsql_ttname  \#?\#{tsql_name}*
 		}
 
 <xc>{xcstart}	{
-#line 481 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 481 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					(yyextra->xcdepth)++;
 					/* Put back any characters past slash-star; see above */
 					yyless(2);
@@ -882,7 +882,7 @@ tsql_ttname  \#?\#{tsql_name}*
 		}
 
 <xc>{xcstop}	{
-#line 491 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 491 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					if (yyextra->xcdepth <= 0)
 						BEGIN(INITIAL);
 					else
@@ -899,7 +899,7 @@ tsql_ttname  \#?\#{tsql_name}*
 		}
 
 <xc>{xcinside}	{
-#line 507 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 507 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
@@ -907,7 +907,7 @@ tsql_ttname  \#?\#{tsql_name}*
 		}
 
 <xc>{op_chars}	{
-#line 514 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 514 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
@@ -915,7 +915,7 @@ tsql_ttname  \#?\#{tsql_name}*
 		}
 
 <xc>\*+		{
-#line 521 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 521 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
@@ -990,14 +990,14 @@ tsql_ttname  \#?\#{tsql_name}*
 											  yyextra->keywordlist);
 					if (kwnum >= 0)
 					{
-#line 595 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 595 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyextra->is_hint_str = false;
 						yylval->keyword = GetScanKeyword(kwnum, yyextra->keywordlist);
 						return yyextra->keyword_tokens[kwnum];
 					}
 					else
 					{
-#line 601 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 601 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						/* If NCHAR isn't a keyword, just return "n" */
 						yylval->str = pstrdup("n");
 						yyextra->ident_quoted = false;
@@ -1084,7 +1084,7 @@ tsql_ttname  \#?\#{tsql_name}*
 
 					if (is_utf16_surrogate_first(c))
 					{
-#line 687 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 687 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyextra->utf16_first_part = c;
 						BEGIN(xeu);
 					}
@@ -1118,7 +1118,7 @@ tsql_ttname  \#?\#{tsql_name}*
 <xe>{xeescape}  {
 					if (yytext[1] == '\'')
 					{
-#line 720 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 720 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						if (u_sess->attr.attr_sql.backslash_quote == BACKSLASH_QUOTE_OFF ||
 							(u_sess->attr.attr_sql.backslash_quote == BACKSLASH_QUOTE_SAFE_ENCODING &&
 							 PG_ENCODING_IS_CLIENT_ONLY(pg_get_client_encoding())))
@@ -1174,7 +1174,7 @@ tsql_ttname  \#?\#{tsql_name}*
 <xdolq>{dolqdelim} {
 					if (strcmp(yytext, yyextra->dolqstart) == 0)
 					{
-#line 775 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 775 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						FREE_POINTER(yyextra->dolqstart);
 						yyextra->dolqstart = NULL;
 						BEGIN(INITIAL);
@@ -1184,7 +1184,7 @@ tsql_ttname  \#?\#{tsql_name}*
 					}
 					else
 					{
-#line 784 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 784 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						/*
 						 * When we fail to match $...$ to dolqstart, transfer
 						 * the $... part to the output, but put back the final
@@ -1328,7 +1328,7 @@ tsql_ttname  \#?\#{tsql_name}*
 					 */
 					if (yyextra->dolqstart == NULL)
 					{
-#line 927 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 927 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						if (yytext[0] == '(')
 							yyextra->paren_depth++;
 						else if (yytext[0] == ')' && yyextra->paren_depth > 0)
@@ -1358,7 +1358,7 @@ tsql_ttname  \#?\#{tsql_name}*
 					if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT &&
 						(u_sess->attr.attr_common.enable_set_variable_b_format || ENABLE_SET_VARIABLES))
 					{
-#line 956 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 956 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						if(nchars > 3 && yytext[0] == '@' && yytext[1] == '`' && yytext[nchars-1] == '`')
 						{
 							char	*subtext = strstr(yytext + 2, "`");
@@ -1374,7 +1374,7 @@ tsql_ttname  \#?\#{tsql_name}*
 
 					if (slashstar && dashdash)
 					{
-#line 971 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 971 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						/* if both appear, take the first one */
 						if (slashstar > dashdash)
 							slashstar = dashdash;
@@ -1397,7 +1397,7 @@ tsql_ttname  \#?\#{tsql_name}*
 							yytext[nchars-1] == '-' ||
 							(DISABLE_ABS && yytext[nchars -1] == '@')))
 					{
-#line 993 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 993 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						int		ic;
 
 						for (ic = nchars-2; ic >= 0; ic--)
@@ -1417,7 +1417,7 @@ tsql_ttname  \#?\#{tsql_name}*
 
 					if (nchars < (int)yyleng)
 					{
-#line 1012 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1012 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						/* Strip the unwanted chars from the token */
 						yyless(nchars);
 						/*
@@ -1446,21 +1446,21 @@ tsql_ttname  \#?\#{tsql_name}*
 					/* Convert "!=" operator to "<>" for compatibility */
 					if (strcmp(yytext, "!=") == 0 || strcmp(yytext, "^=") == 0)
 					{
-#line 1040 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1040 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->str = pstrdup("<>");
 						yyextra->is_hint_str = false;
 						return CmpOp;
 					}
 					else if (strcmp(yytext, ">=") == 0 || strcmp(yytext, "<=") == 0 || strcmp(yytext, "<>") == 0)
 					{
-#line 1046 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1046 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->str = pstrdup(yytext);
 						yyextra->is_hint_str = false;
 						return CmpOp;
 					}
 					else if (strcmp(yytext, "<=>") == 0 && (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT))
 					{
-#line 1052 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1052 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->str = pstrdup(yytext);
 						yyextra->is_hint_str = false;
 						return CmpNullOp;
@@ -1511,12 +1511,12 @@ tsql_ttname  \#?\#{tsql_name}*
 {decimalf}		{
 					if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT &&
 						u_sess->attr.attr_sql.float_suffix_acceptance) {
-#line 1102 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1102 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						SET_YYLLOC();
 						yyextra->is_hint_str = false;
 						return process_decimal_float(yytext, yyleng, yyscanner, yylval);
 					} else {
-#line 1106 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1106 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyless(yyleng-1);
 						SET_YYLLOC();
 						yylval->str = pstrdup(yytext);
@@ -1527,12 +1527,12 @@ tsql_ttname  \#?\#{tsql_name}*
 {realf}			{
 					if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT &&
 						u_sess->attr.attr_sql.float_suffix_acceptance) {
-#line 1116 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1116 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						SET_YYLLOC();
 						yyextra->is_hint_str = false;
 						return process_decimal_float(yytext, yyleng, yyscanner, yylval);
 					} else {
-#line 1120 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1120 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyless(yyleng-1);
 						SET_YYLLOC();
 						yylval->str = pstrdup(yytext);
@@ -1543,12 +1543,12 @@ tsql_ttname  \#?\#{tsql_name}*
 {decimald}		{
 					if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT &&
 						u_sess->attr.attr_sql.float_suffix_acceptance) {
-#line 1130 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1130 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						SET_YYLLOC();
 						yyextra->is_hint_str = false;
 						return process_decimal_double(yytext, yyleng, yyscanner, yylval);
 					} else {
-#line 1134 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1134 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyless(yyleng-1);
 						SET_YYLLOC();
 						yylval->str = pstrdup(yytext);
@@ -1559,12 +1559,12 @@ tsql_ttname  \#?\#{tsql_name}*
 {reald}			{
 					if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT &&
 						u_sess->attr.attr_sql.float_suffix_acceptance) {
-#line 1144 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1144 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						SET_YYLLOC();
 						yyextra->is_hint_str = false;
 						return process_decimal_double(yytext, yyleng, yyscanner, yylval);
 					} else {
-#line 1148 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1148 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyless(yyleng-1);
 						SET_YYLLOC();
 						yylval->str = pstrdup(yytext);
@@ -1606,7 +1606,7 @@ tsql_ttname  \#?\#{tsql_name}*
 					yylval->str = pstrdup(yytext);
 					for (int i = strlen(yylval->str) - 1; i > 0; i--)
 					{
-#line 1189 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1189 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						if (yylval->str[i] == '.')
 						{
 							yylval->str[i] = DB4AI_SNAPSHOT_VERSION_SEPARATOR;
@@ -1619,7 +1619,7 @@ tsql_ttname  \#?\#{tsql_name}*
 {set_identifier} {
 					if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT &&
 						(u_sess->attr.attr_common.enable_set_variable_b_format || ENABLE_SET_VARIABLES)) {
-#line 1201 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1201 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						char		   *set_ident;
 						SET_YYLLOC();
  
@@ -1640,7 +1640,7 @@ tsql_ttname  \#?\#{tsql_name}*
 							return SET_IDENT;
 						}
 					} else {
-#line 1221 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1221 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						SET_YYLLOC();
 						yyless(2);
 						yylval->str = pstrdup(yytext);
@@ -1664,7 +1664,7 @@ tsql_ttname  \#?\#{tsql_name}*
 						semtc_is_token_in_ignore_keyword_list(yyextra->keyword_tokens[kwnum], false) : false;
 					if (kwnum >= 0 && !need_ignore)
 					{
-#line 1244 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1244 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->keyword = GetScanKeyword(kwnum, yyextra->keywordlist);
                         uint16 token = yyextra->keyword_tokens[kwnum];
 
@@ -1719,7 +1719,7 @@ tsql_ttname  \#?\#{tsql_name}*
 					if (ident[0] == '_' &&
 						ENABLE_MULTI_CHARSET &&
 						pg_valid_server_encoding(ident + 1) >= 0) {
-#line 1298 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1298 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->str = pstrdup(ident + 1);
 						yyextra->is_hint_str = false;
 						yyextra->ident_quoted = false;
@@ -1735,12 +1735,12 @@ tsql_ttname  \#?\#{tsql_name}*
 					SET_YYLLOC();
 					if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT &&
 						(u_sess->attr.attr_common.enable_set_variable_b_format || ENABLE_SET_VARIABLES || u_sess->attr.attr_common.b_compatibility_user_host_auth)) {
-#line 1313 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1313 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yylval->str = pstrdup(yytext + 1);
 						yyextra->is_hint_str = false;
 						return SET_USER_IDENT;
 					} else {
-#line 1317 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1317 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 						yyless(1);
 						yylval->str = pstrdup(yytext);
 						yyextra->is_hint_str = false;
@@ -2059,22 +2059,22 @@ scanner_yyerror(const char *message, core_yyscan_t yyscanner)
 #ifndef ENABLE_MULTIPLE_NODES
         if (rc != PLPGSQL_COMPILE_NULL && u_sess->attr.attr_common.plsql_show_all_error
             && t_thrd.log_cxt.errordata_stack_depth <= ERRORDATA_STACK_SIZE - 2) {
-#line 1403 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1403 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
             lines = GetProcedureLineNumberInPackage(u_sess->plsql_cxt.curr_compile_context->core_yy->scanbuf, u_sess->plsql_cxt.plpgsql_yylloc);
             addErrorList(message, lines);
         }
         if (u_sess->attr.attr_common.plsql_show_all_error && rc != PLPGSQL_COMPILE_NULL) {
-#line 1407 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1407 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
             errstate = NOTICE;
         } else {
-#line 1409 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1409 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
             errstate = ERROR;
         }
 #else
         errstate = ERROR;
 #endif 
     if (rc == PLPGSQL_COMPILE_PACKAGE_PROC) {
-#line 1415 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1415 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		PLpgSQL_function* func = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile;
 		if (*loc == YY_END_OF_BUFFER_CHAR)
 		{
@@ -2095,7 +2095,7 @@ scanner_yyerror(const char *message, core_yyscan_t yyscanner)
                     erraction("Check character string")));
 		}
 	} else {
-#line 1435 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1435 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (*loc == YY_END_OF_BUFFER_CHAR)
 		{
 			ereport(errstate,
@@ -2186,7 +2186,7 @@ scanner_finish(core_yyscan_t yyscanner)
 {
 	if (t_thrd.postgres_cxt.clear_key_memory)
 	{
-#line 1525 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1525 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		errno_t rc = EOK;
 		memset(yyextra->scanbuf, 0x7F, yyextra->scanbuflen);
 		*(volatile char*)(yyextra->scanbuf) = *(volatile char*)(yyextra->scanbuf);
@@ -2210,7 +2210,7 @@ scanner_finish(core_yyscan_t yyscanner)
 		FREE_POINTER(yyextra->literalbuf);
 	if (yyextra->parameter_list)
 	{
-#line 1548 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1548 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		list_free_deep(yyextra->parameter_list);
 		yyextra->parameter_list = NIL;
 	}
@@ -2223,7 +2223,7 @@ addlit(char *ytext, int yleng, core_yyscan_t yyscanner)
 	/* enlarge buffer if needed */
 	if ((yyextra->literallen + yleng) >= yyextra->literalalloc)
 	{
-#line 1560 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1560 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		do
 		{
 			yyextra->literalalloc *= 2;
@@ -2245,7 +2245,7 @@ addlitchar(unsigned char ychar, core_yyscan_t yyscanner)
 	/* enlarge buffer if needed */
 	if ((yyextra->literallen + 1) >= yyextra->literalalloc)
 	{
-#line 1581 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1581 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		yyextra->literalalloc *= 2;
 		yyextra->literalbuf = (char *) repalloc(yyextra->literalbuf,
 												yyextra->literalalloc);
@@ -2258,7 +2258,7 @@ addlitchar(unsigned char ychar, core_yyscan_t yyscanner)
 static void set_is_delimiter_name(char* text, core_yyscan_t yyscanner)
 { 
 	if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
-#line 1593 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1593 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (strcmp(text,u_sess->attr.attr_common.delimiter_name) == 0 && yyextra->paren_depth == 0 && !yyextra->in_slash_proc_body) {
 			if (strcmp(text,";") != 0) {
 				yyextra->query_string_locationlist = lappend_int(yyextra->query_string_locationlist, *yylloc);
@@ -2305,7 +2305,7 @@ process_integer_literal(const char *token, YYSTYPE *lval)
 #endif
 		)
 	{
-#line 1639 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1639 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		/* integer too large, treat it as a float */
 		lval->str = pstrdup(token);
 		return FCONST;
@@ -2346,7 +2346,7 @@ handle_float_overflow(char *token, core_yyscan_t yyscanner)
 	char	   *result = token;
 
 	if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
-#line 1679 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1679 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		return result;
 	}
 
@@ -2354,7 +2354,7 @@ handle_float_overflow(char *token, core_yyscan_t yyscanner)
 	val = strtod(result, &endptr);
 
 	if (errno == ERANGE) {
-#line 1686 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1686 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (val == 0.0 || val >= HUGE_VAL || val <= -HUGE_VAL) {
 			yyerror("number overflow");
 		}
@@ -2385,7 +2385,7 @@ check_unicode_value(pg_wchar c, const char *loc, core_yyscan_t yyscanner)
 
 	if (c > 0x7F)
 	{
-#line 1716 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1716 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		ADVANCE_YYLLOC(loc - yyextra->literalbuf + 3);   /* 3 for U&" */
 		yyerror("Unicode escape values cannot be used for code point values above 007F when the server encoding is not UTF8");
 	}
@@ -2418,7 +2418,7 @@ addunicode(pg_wchar c, core_yyscan_t yyscanner)
 		yyerror("invalid Unicode escape value");
 	if (c > 0x7F)
 	{
-#line 1748 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1748 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (GetDatabaseEncoding() != PG_UTF8)
 			yyerror("Unicode escape values cannot be used for code point values above 007F when the server encoding is not UTF8");
 		yyextra->saw_non_ascii = true;
@@ -2440,7 +2440,7 @@ litbuf_udeescape(unsigned char escape, core_yyscan_t yyscanner)
 		|| escape == '"'
 		|| scanner_isspace(escape))
 	{
-#line 1769 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1769 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		ADVANCE_YYLLOC(yyextra->literallen + yyleng + 1);
 		yyerror("invalid Unicode escape character");
 	}
@@ -2459,7 +2459,7 @@ litbuf_udeescape(unsigned char escape, core_yyscan_t yyscanner)
 	out = newm;
 	while (*in)
 	{
-#line 1787 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1787 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (in[0] == escape)
 		{
 			if (in[1] == escape)
@@ -2571,7 +2571,7 @@ litbuf_udeescape(unsigned char escape, core_yyscan_t yyscanner)
 	/* unfinished surrogate pair? */
 	if (pair_first)
 	{
-#line 1898 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1898 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		ADVANCE_YYLLOC(in - litbuf + 3);			/* 3 for U&" */
 		yyerror("invalid Unicode surrogate pair");
 	}
@@ -2591,7 +2591,7 @@ unescape_single_char(unsigned char c, core_yyscan_t yyscanner)
 {
 	switch (c)
 	{
-#line 1917 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1917 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		case 'b':
 			return '\b';
 		case 'f':
@@ -2616,7 +2616,7 @@ check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner)
 {
 	if (ychar == '\'')
 	{
-#line 1941 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1941 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (yyextra->warn_on_first_escape && u_sess->attr.attr_sql.escape_string_warning)
 			ereport(WARNING,
 					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
@@ -2627,7 +2627,7 @@ check_string_escape_warning(unsigned char ychar, core_yyscan_t yyscanner)
 	}
 	else if (ychar == '\\')
 	{
-#line 1951 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 1951 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (yyextra->warn_on_first_escape && u_sess->attr.attr_sql.escape_string_warning)
 			ereport(WARNING,
 					(errcode(ERRCODE_NONSTANDARD_USE_OF_ESCAPE_CHARACTER),
@@ -2697,7 +2697,7 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 
 	if (initflag)
 	{ 
-#line 2020 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 2020 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		u_sess->parser_cxt.is_load_copy = false;
 		u_sess->parser_cxt.col_list = NULL;
 		u_sess->parser_cxt.has_dollar = false;
@@ -2707,7 +2707,7 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 
 	if (placeholder == false)
 	{
-#line 2029 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 2029 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (u_sess->parser_cxt.has_placeholder)
 			ereport(ERROR, 
 					(errcode(ERRCODE_SYNTAX_ERROR), 
@@ -2724,7 +2724,7 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 
 
 	if(u_sess->parser_cxt.is_load_copy == true){
-#line 2045 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 2045 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		if (yyextra->ident_quoted)
 			u_sess->parser_cxt.copy_fieldname = pstrdup(string);
 		else
@@ -2732,7 +2732,7 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 	}
 	foreach(cell, yyextra->parameter_list)
 	{
-#line 2052 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 2052 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		result++;
 		if (strcmp((char*)(lfirst(cell)),string) == 0)
 			return result;
@@ -2771,7 +2771,7 @@ is_trans_stmt(const char *haystack, int haystack_len)
 	/* find if the 2nd line is prefixed by a valid transaction token */
 	while (temp < tempstr + haystack_len)
 	{
-#line 2090 "/home/yanyz/olap/openGauss-server/./src/src/common/backend/parser/scan.l"
+#line 2090 "/mnt/nvme1p1/yanyz/openGauss-server/./src/src/common/backend/parser/scan.l"
 		/* there may be '\0' in the string, and should be skipped */
 		if (*temp == '\0')
 		{

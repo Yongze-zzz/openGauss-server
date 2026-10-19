@@ -350,7 +350,6 @@ void PortalCleanup(Portal portal)
             {
                 //add cache trace function
                 VecCacheTraceDiscard();
-                VecEngineProfileDiscard();
 
                 /* Ensure CurrentResourceOwner is restored on error */
                 t_thrd.utils_cxt.CurrentResourceOwner = saveResourceOwner;

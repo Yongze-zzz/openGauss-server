@@ -314,7 +314,8 @@ bool IMCStore::ImcstoreFillByDeltaScan(_in_ CStoreScanState* state, _out_ Vector
         currentThreadID = SS_IMCU_CACHE->curSpqIdx + currentThreadID * SS_IMCU_CACHE->spqNodeNum;
     }
     for (uint32 currid = m_delMaskCUId == InValidCUID ? 0 : m_delMaskCUId; currid <= cuid; ++currid) {
-        if (totalThread > 1 && currid % totalThread != currentThreadID) {
+        /* A statically assigned partition includes all main CUs and delta groups. */
+        if (!m_partitionWiseScan && totalThread > 1 && currid % totalThread != currentThreadID) {
             continue;
         }
         FillPerRowGroupDelta((IMCStoreScanState*)state, currid, vecBatchOut);
@@ -442,7 +443,7 @@ bool IMCStore::LoadCUDesc(
     }
     for (uint32 cuid = loadCUDescInfoPtr->nextCUID; cuid <= m_endCUID && loadCUDescInfoPtr->HasFreeSlot(); ++cuid) {
         /* Parallel scan CU divide. */
-        if (totalThread > 1 && cuid % totalThread != currentThreadID) {
+        if (!m_partitionWiseScan && totalThread > 1 && cuid % totalThread != currentThreadID) {
             continue;
         }
         RowGroup* rowgroup = m_imcstoreDesc->GetRowGroup(cuid);

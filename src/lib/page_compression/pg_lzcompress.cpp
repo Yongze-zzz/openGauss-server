@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/common/backend/utils/adt/pg_lzcompress.cpp
+/mnt/nvme1p1/yanyz/openGauss-server/./src/common/backend/utils/adt/pg_lzcompress.cpp

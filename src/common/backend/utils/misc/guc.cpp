@@ -255,6 +255,13 @@ THR_LOCAL GucContext currentGucContext;
 const char* sync_guc_variable_namelist[] = {"work_mem",
     "borrow_work_mem",
     "query_mem",
+    // GUC variable for [chiplet-unaware imcs]/[chiplet-aware]/[cpu & mem-map for scalability experiment control],
+#ifdef ENABLE_HTAP
+    "enable_imcs_partition_scan",
+    "enable_numa_aware_partition_scan",
+    "imcs_partition_scan_cpus",
+    "imcs_partition_numa_map",
+#endif
     "ustore_attr",
     "ssl_renegotiation_limit",
     "temp_buffers",

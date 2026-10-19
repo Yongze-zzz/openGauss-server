@@ -51,6 +51,10 @@
 #include "utils/timestamp.h"
 #include "instruments/instr_handle_mgr.h"
 
+#ifdef ENABLE_HTAP
+#include "access/htap/imcs_partition_wise.h"
+#endif
+
 extern void CodeGenThreadInitialize();
 extern void InitRecursiveCTEGlobalVariables(const PlannedStmt* planstmt);
 
@@ -145,6 +149,9 @@ int StreamMain()
 
         execute_stream_plan(u_sess->stream_cxt.producer_obj);
         execute_stream_end(u_sess->stream_cxt.producer_obj);
+#ifdef ENABLE_HTAP
+        ImcsPartitionWiseWorkerLeave();
+#endif
         WLMReleaseNodeFromHash();
         WLMReleaseIoInfoFromHash();
         /* Reset here so that we can get debug_query_string when Stream thread is in Sync point */
@@ -339,7 +346,9 @@ static void HandleStreamSigjmp()
 {
     pgstat_report_waitstatus(STATE_WAIT_UNDEFINED);
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
-
+// #ifdef ENABLE_HTAP
+//     ImcsPartitionWiseWorkerLeave();
+// #endif
     /* output the memory tracking information when error happened */
     MemoryTrackingOutputFile();
 

@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/gausskernel/storage/file/fio_device.cpp
+/mnt/nvme1p1/yanyz/openGauss-server/./src/gausskernel/storage/file/fio_device.cpp

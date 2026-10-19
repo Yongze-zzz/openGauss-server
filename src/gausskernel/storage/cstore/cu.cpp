@@ -222,6 +222,8 @@ void CU::Reset()
 
 #ifdef ENABLE_HTAP
     imcsDesc = NULL;
+    m_partitionWiseBuffer = NULL;
+    m_partitionWiseBufferSize = 0;
 #endif
 }
 
@@ -263,7 +265,9 @@ CU::CU()
 CU::~CU()
 {
     FreeSrcBuf();
-
+#ifdef ENABLE_HTAP
+    FreePartitionWiseBuffer();
+#endif
     m_nulls = NULL;
     m_tmpinfo = NULL;
     m_compressedBuf = NULL;
@@ -1747,6 +1751,10 @@ int CU::GetCompressBufSize() const
 FORCE_INLINE
 int CU::GetUncompressBufSize() const
 {
+#ifdef ENABLE_HTAP
+    if (m_partitionWiseBuffer != NULL)
+        return (int)m_partitionWiseBufferSize;
+#endif
     return m_srcBufSize + m_offsetSize;
 }
 
@@ -1863,6 +1871,7 @@ int CU::GetCurScanPos(int rowCursorInCU)
 #ifdef ENABLE_HTAP
 void IMCSDesc::Init(Relation rel, int2vector* imcstoreAttsNum, int imcstoreNatts, bool useShareMemroy)
 {
+    dataNumaNode = -1;
     relOid = RelationGetRelid(rel);
     relfilenode = RelationGetRelFileNode(rel);
     imcsAttsNum = int2vectorCopy(imcstoreAttsNum);
@@ -2065,6 +2074,7 @@ IMCSDesc::IMCSDesc()
     shareMemPool = NULL;
     populateInShareMem = false;
     isShmNotEnough = false;
+    dataNumaNode = -1;
 }
 
 IMCSDesc::~IMCSDesc()

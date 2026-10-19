@@ -29,6 +29,10 @@
 #include "pgxc/locator.h"
 #include "pgxc/pgxc.h"
 
+#ifdef ENABLE_HTAP
+    #include "access/htap/imcs_ctlg.h"
+#endif
+
 static void stream_walker_query_update(Query* query, shipping_context *cxt);
 static void stream_walker_query_recursive(Query* query, shipping_context *cxt);
 static void stream_walker_query_distinct(Query* query, shipping_context *cxt);
@@ -648,21 +652,26 @@ static bool contains_unsupport_tables(List* rtable, Query* query, shipping_conte
                  * Native partition tables use the inheritance flag as an
                  * implementation detail, but are planned with PartIterator
                  * rather than the generic inheritance Append machinery.  In
-                 * single-node partition-lane mode they are safe to execute
-                 * with a stream plan; rejecting them here silently resets the
-                 * whole query to DOP 1 before the parallel CStore paths in
-                 * allpaths.cpp can be considered.
+                 * single-node CStore/IMCS scans they can use a stream plan.
+                 * IMCS admission uses enable_imcsscan for native CU, plain
+                 * partition and NUMA-aware scans alike. The two experiment
+                 * switches therefore do not change Stream admission.
                  */
-                bool allowPartitionLaneStream = false;
-                if (IS_SINGLE_NODE && u_sess->attr.attr_sql.enable_cstore_partition_lane_scan) {
+               bool allowPartitionWiseStream = false;
+               bool partitionScanEnabled = u_sess->attr.attr_sql.enable_cstore_partition_lane_scan;
+#ifdef ENABLE_HTAP
+                partitionScanEnabled = partitionScanEnabled ||
+                    (u_sess->attr.attr_sql.enable_imcsscan && RelHasImcs(rte->relid));
+#endif
+                if (IS_SINGLE_NODE && partitionScanEnabled) {
                     /* rte->ispartrel is populated later on some single-node paths. */
                     Relation relation = try_relation_open(rte->relid, NoLock);
                     if (relation != NULL) {
-                        allowPartitionLaneStream = RelationIsPartitioned(relation);
+                        allowPartitionWiseStream = RelationIsPartitioned(relation);
                         relation_close(relation, NoLock);
                     }
                 }
-                if (rte->inh && has_subclass(rte->relid) && !allowPartitionLaneStream) {
+                if (rte->inh && has_subclass(rte->relid) && !allowPartitionWiseStream) {
                     sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
                         NOTPLANSHIPPING_LENGTH,
                         "Table %s inherited can not be shipped",

@@ -164,7 +164,8 @@ CmkemErrCode encrypt_with_sm2_pubkey(CmkemUStr *plain, CmkemUStr *pub_key, Cmkem
         return CMKEM_EVP_ERR;
     }
 
-#ifndef ENABLE_OPENSSL3
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    /* OpenSSL 3.0 recognizes SM2 keys automatically and removed this API. */
     ret = EVP_PKEY_set_alias_type(public_evp_key, EVP_PKEY_SM2);
     if (ret != 1) {
         cmkem_errmsg("EVP_PKEY_set_alias_type to EVP_PKEY_SM2 failed!");
@@ -256,7 +257,8 @@ CmkemErrCode decrypt_with_sm2_privkey(CmkemUStr *cipher, CmkemUStr *priv_key, Cm
         return CMKEM_EVP_ERR;
     }
 
-#ifndef ENABLE_OPENSSL3
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    /* OpenSSL 3.0 recognizes SM2 keys automatically and removed this API. */
     ret = EVP_PKEY_set_alias_type(private_evp_key, EVP_PKEY_SM2);
     if (ret != 1) {
         cmkem_errmsg("EVP_PKEY_set_alias_type to EVP_PKEY_SM2 failed!");

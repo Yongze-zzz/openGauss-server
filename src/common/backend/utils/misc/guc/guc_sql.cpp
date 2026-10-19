@@ -736,6 +736,18 @@ static void InitSqlConfigureNamesBool()
             NULL,
             NULL},
 #ifdef ENABLE_HTAP
+        {{"enable_imcs_partition_scan",
+            PGC_USERSET, NODE_ALL, QUERY_TUNING_METHOD,
+            gettext_noop("Assigns whole IMCS partitions to parallel workers in round-robin order."),
+            NULL},
+            &u_sess->attr.attr_sql.enable_imcs_partition_scan,
+            false, NULL, NULL, NULL},
+        {{"enable_numa_aware_partition_scan",
+            PGC_USERSET, NODE_ALL, QUERY_TUNING_METHOD,
+            gettext_noop("Assigns IMCS partitions to NUMA-local workers and binds their CPUs. Requires enable_imcs_partition_scan."),
+            NULL},
+            &u_sess->attr.attr_sql.enable_numa_aware_partition_scan,
+            false, NULL, NULL, NULL},
         {{"enable_imcsscan",
             PGC_USERSET,
             NODE_ALL,
@@ -3245,6 +3257,18 @@ static void InitSqlConfigureNamesInt64()
 static void InitSqlConfigureNamesString()
 {
     struct config_string localConfigureNamesString[] = {
+#ifdef ENABLE_HTAP
+        {{"imcs_partition_scan_cpus",
+            PGC_USERSET, NODE_ALL, QUERY_TUNING_METHOD,
+            gettext_noop("Ordered, comma-separated CPU IDs for NUMA-aware IMCS partition scans."), NULL},
+            &u_sess->attr.attr_sql.imcs_partition_scan_cpus,
+            "", NULL, NULL, NULL},
+        {{"imcs_partition_numa_map",
+            PGC_USERSET, NODE_ALL, QUERY_TUNING_METHOD,
+            gettext_noop("Partition OID:NUMA node pairs used when populating local IMCS CU buffers."), NULL},
+            &u_sess->attr.attr_sql.imcs_partition_numa_map,
+            "", NULL, NULL, NULL},
+#endif
         {{"expected_computing_nodegroup",
             PGC_USERSET,
             NODE_DISTRIBUTE,

@@ -44,6 +44,7 @@
 #include "access/htap/imcs_hash_table.h"
 #include "storage/matrix_mem.h"
 #include "access/htap/imcs_ctlg.h"
+#include "access/htap/imcs_partition_wise.h"
 
 void CheckImcstoreCacheReady()
 {
@@ -413,7 +414,8 @@ void CreateImcsDescForPrimaryNode(Relation rel, int2vector* imcsAttsNum, int imc
     }
 }
 
-void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNatts, bool useShareMemroy)
+static void AlterTableEnableImcstoreInternal(Relation rel, int2vector* imcsAttsNum,
+    int imcsNatts, bool useShareMemroy, HTAB* dataNodes)
 {
     /* 1. create imcsdesc for rel */
     IMCS_HASH_TABLE->CreateImcsDesc(rel, imcsAttsNum, imcsNatts, useShareMemroy);
@@ -429,13 +431,13 @@ void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNat
                 partition = (Partition)lfirst(cell);
                 partRel = partitionGetRelation(rel, partition);
 				/* start to populate partition */
-                AlterTableEnableImcstore(partRel, imcsAttsNum, imcsNatts, useShareMemroy);
+                AlterTableEnableImcstoreInternal(partRel, imcsAttsNum, imcsNatts, useShareMemroy, dataNodes);
                 releaseDummyRelation(&partRel);
             }
             releasePartitionList(rel, &partitions, NoLock);
         } else {
             /* 3. not partition rel, start populate rel */
-            EnableImcstoreForRelation(rel, imcsAttsNum, imcsNatts);
+            EnableImcstoreForRelation(rel, imcsAttsNum, imcsNatts, dataNodes);
         }
         /* 4. update status */
         IMCS_HASH_TABLE->UpdateImcsStatus(RelationGetRelid(rel), IMCS_POPULATE_COMPLETE);
@@ -455,8 +457,32 @@ void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNat
     PG_END_TRY();
 }
 
-void EnableImcstoreForRelation(Relation rel, int2vector* imcsAttsNum, int imcsNatts)
+void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNatts, bool useShareMemroy)
 {
+    HTAB* dataNodes = ImcsPartitionWiseParseDataNodes();
+    PG_TRY();
+    {
+        AlterTableEnableImcstoreInternal(rel, imcsAttsNum, imcsNatts, useShareMemroy, dataNodes);
+    }
+    PG_CATCH();
+    {
+        if (dataNodes != NULL)
+            hash_destroy(dataNodes);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    if (dataNodes != NULL)
+        hash_destroy(dataNodes);
+}
+
+void EnableImcstoreForRelation(Relation rel, int2vector* imcsAttsNum, int imcsNatts, HTAB* dataNodes)
+{
+    IMCSDesc* desc = IMCS_HASH_TABLE->GetImcsDesc(RelationGetRelid(rel));
+    desc->dataNumaNode = ImcsPartitionWiseDataNode(dataNodes, RelationGetRelid(rel));
+    if (desc->dataNumaNode >= 0 &&
+        (ENABLE_DSS || !IS_SINGLE_NODE || g_instance.attr.attr_memory.enable_borrow_memory))
+        ereport(ERROR, (errmsg("NUMA IMCS populate requires local, single-node IMCS without borrowed memory")));
+    /* Shared descriptors also carry the layout into native parallel populate workers. */
     if (u_sess->attr.attr_common.enable_parallel_populate) {
         ParallelPopulateImcs(rel, imcsAttsNum, imcsNatts);
     } else {

@@ -31,6 +31,7 @@
 #include "access/ustore/knl_upage.h"
 #include "pgxc/pgxcnode.h"
 #include "postmaster/bgworker.h"
+#include "utils/hsearch.h"
 
 #define MAX_IMCS_PAGES_ONE_CU 1024
 #define MAX_IMCS_COL_LENGTH 8192
@@ -117,7 +118,7 @@ extern void CreateImcsDescForPrimaryNode(Relation rel, int2vector* imcsAttsNum, 
 
 extern void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNatts, bool useShareMemroy = false);
 
-extern void EnableImcstoreForRelation(Relation rel, int2vector* imcsAttsNum, int imcsNatts);
+extern void EnableImcstoreForRelation(Relation rel, int2vector* imcsAttsNum, int imcsNatts, HTAB* dataNodes);
 
 extern void PopulateImcs(Relation rel, int2vector* imcsAttsNum, int imcsNatts);
 

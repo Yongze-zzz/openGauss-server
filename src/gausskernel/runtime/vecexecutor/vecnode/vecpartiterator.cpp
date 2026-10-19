@@ -34,6 +34,14 @@
 #include "vecexecutor/vectorbatch.h"
 #include "vecexecutor/vecexecutor.h"
 
+#ifdef ENABLE_HTAP
+    #include "access/htap/imcs_hash_table.h"
+    #include "access/htap/imcs_partition_wise.h"
+    #include "vecexecutor/vecnodeimcstorescan.h"
+    #include "storage/cu.h"
+    #include "utils/rel_gs.h"
+#endif
+
 VecPartIteratorState* ExecInitVecPartIterator(VecPartIterator* node, EState* estate, int eflags)
 {
     VecPartIteratorState* state = NULL;
@@ -49,6 +57,7 @@ VecPartIteratorState* ExecInitVecPartIterator(VecPartIterator* node, EState* est
     state->ps.subPlan = NULL;
     state->currentItr = -1;
     state->subPartCurrentItr = -1;
+    state->partitionWiseWorkers = NULL;
     state->ps.ps_vec_TupFromTlist = false;
     state->ps.ps_ProjInfo = NULL;
     state->ps.vectorized = true;
@@ -64,6 +73,9 @@ static int GetVecscanPartitionNum(const PartIteratorState* node)
     int partitionScan;
     switch (nodeTag(noden)) {
         case T_CStoreScanState:
+#ifdef ENABLE_HTAP
+        case T_IMCStoreScanState:
+#endif
             partitionScan = ((CStoreScanState*)noden)->part_id;
             break;
 #ifdef ENABLE_MULTIPLE_NODES
@@ -103,20 +115,69 @@ static int GetVecscanPartitionNum(const PartIteratorState* node)
     return partitionScan;
 }
 
-static CStoreScanState* GetPartitionLaneCStoreScan(VecPartIteratorState* node)
+// static CStoreScanState* GetPartitionLaneCStoreScan(VecPartIteratorState* node)
+static CStoreScanState* GetPartitionWiseScan(VecPartIteratorState* node)
 {
-    if (!u_sess->attr.attr_sql.enable_cstore_partition_lane_scan ||
-        u_sess->stream_cxt.producer_dop <= 1 || !IsA(node->ps.lefttree, CStoreScanState)) {
+    // if (!u_sess->attr.attr_sql.enable_cstore_partition_lane_scan ||
+    //     u_sess->stream_cxt.producer_dop <= 1 || !IsA(node->ps.lefttree, CStoreScanState)) {
+    if (u_sess->stream_cxt.producer_dop <= 1) {
         return NULL;
     }
-
+    bool enabled = IsA(node->ps.lefttree, CStoreScanState) &&
+        u_sess->attr.attr_sql.enable_cstore_partition_lane_scan;
+#ifdef ENABLE_HTAP
+    bool imcsScan = IsA(node->ps.lefttree, IMCStoreScanState);
+    /* NUMA scheduling adds locality to whole-partition scans; it does not enable them. */
+    if (imcsScan && u_sess->attr.attr_sql.enable_numa_aware_partition_scan &&
+        !u_sess->attr.attr_sql.enable_imcs_partition_scan) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("NUMA-aware IMCS partition scans require enable_imcs_partition_scan"),
+            errhint("Set enable_imcs_partition_scan = on before running the scan.")));
+    }
+    enabled = enabled || (imcsScan && u_sess->attr.attr_sql.enable_imcs_partition_scan);
+#endif
+    if (!enabled)
+       return NULL;
     CStoreScanState* scan = (CStoreScanState*)node->ps.lefttree;
     if (!scan->isPartTbl || ((Scan*)scan->ps.plan)->partition_iterator_elimination) {
         return NULL;
     }
-
+#ifdef ENABLE_HTAP
+    /* First version supports local one-level partitions; never partially scan a subpartition tree. */
+    if (imcsScan && (!IS_SINGLE_NODE || ENABLE_DSS || IS_SPQ_RUNNING ||
+        ((SpqCStoreScan*)scan->ps.plan)->isShareScan || scan->subPartLengthList != NIL))
+        ereport(ERROR, (errmsg("Static IMCS PartitionWise requires local, non-shared, one-level partitions")));
+#endif
     return scan;
 }
+
+#ifdef ENABLE_HTAP
+static void InitImcsNumaPartitionWorkers(VecPartIteratorState* node, CStoreScanState* scan, int partitions)
+{
+    int workers = (int)u_sess->stream_cxt.producer_dop;
+    ImcsPartitionWiseWorkerEnter((int)u_sess->stream_cxt.smp_id, workers);
+    if (list_length(scan->partitions) != partitions)
+        ereport(ERROR, (errmsg("IMCS PartitionWise partition list does not match the pruning result")));
+    node->partitionWiseWorkers = (int*)MemoryContextAlloc(node->ps.state->es_query_cxt, sizeof(int) * partitions);
+    int nodeOrdinals[sizeof(unsigned long) * 8] = {0};
+    int index = 0;
+    ListCell* cell = NULL;
+    foreach (cell, scan->partitions) {
+        CHECK_FOR_INTERRUPTS();
+        Oid oid = ((Partition)lfirst(cell))->pd_id;
+        IMCSDesc* desc = IMCS_HASH_TABLE->GetImcsDesc(oid);
+        if (desc == NULL || desc->dataNumaNode < 0 || desc->dataNumaNode >= (int)lengthof(nodeOrdinals))
+            ereport(ERROR, (errmsg("IMCS partition %u has no NUMA data layout", oid),
+                errhint("Set imcs_partition_numa_map before repopulating this partition.")));
+        /* Count within the data node, not across interleaved global partition indices. */
+        int ordinal = nodeOrdinals[desc->dataNumaNode]++;
+        node->partitionWiseWorkers[index] = ImcsPartitionWiseWorker(index, ordinal, desc->dataNumaNode, workers);
+        ereport(DEBUG1, (errmsg("IMCS PartitionWise partition=%u node=%d worker=%d",
+            oid, desc->dataNumaNode, node->partitionWiseWorkers[index])));
+        ++index;
+    }
+}
+#endif
 
 /* return: false means all patition finished */
 static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
@@ -127,7 +188,8 @@ static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
     ParamExecData* param = NULL;
     List* subPartLengthList = NULL;
     PlanState* noden = NULL;
-    CStoreScanState* laneScan = GetPartitionLaneCStoreScan(node);
+    // CStoreScanState* laneScan = GetPartitionLaneCStoreScan(node);
+    CStoreScanState* wiseScan = GetPartitionWiseScan(node);
 
     /* check sub partitions */
     if (IsA(node->ps.lefttree, RowToVecState)) {
@@ -146,17 +208,34 @@ static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
     }
 #endif
 
-    if (laneScan != NULL) {
+    // if (laneScan != NULL) {
+    if (wiseScan != NULL) {
         int dop = (int)u_sess->stream_cxt.producer_dop;
-        int lane = (int)u_sess->stream_cxt.smp_id;
-        int nextItr = (node->currentItr < 0) ? lane : node->currentItr + dop;
+        // int lane = (int)u_sess->stream_cxt.smp_id;
+        // int nextItr = (node->currentItr < 0) ? lane : node->currentItr + dop;
+        int worker = (int)u_sess->stream_cxt.smp_id;
+        /* Plain partition scans reuse CStore's static round-robin iteration. */
+        int nextItr = (node->currentItr < 0) ? worker : node->currentItr + dop;
+#ifdef ENABLE_HTAP
+        /* Only the NUMA option reads data-node metadata and binds the worker. */
+        if (wiseScan->m_isImcstore && u_sess->attr.attr_sql.enable_numa_aware_partition_scan) {
+            if (node->partitionWiseWorkers == NULL)
+                InitImcsNumaPartitionWorkers(node, wiseScan, partitionScan);
+            for (nextItr = node->currentItr + 1; nextItr < partitionScan; ++nextItr) {
+                int index = BackwardScanDirection == pi_node->direction ? partitionScan - nextItr - 1 : nextItr;
+                if (node->partitionWiseWorkers[index] == worker)
+                    break;
+            }
+        }
+#endif
 
         if (nextItr >= partitionScan) {
             return false;
         }
 
         node->currentItr = nextItr;
-        laneScan->partitionLaneScan = true;
+        // laneScan->partitionLaneScan = true;
+        wiseScan->partitionWiseScan = true;
     } else if (node->currentItr + 1 >= partitionScan) {
         /* if there is no partition to scan, return false */
         if (subPartLengthList != NIL) {
@@ -172,7 +251,7 @@ static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
     Assert(ForwardScanDirection == pi_node->direction || BackwardScanDirection == pi_node->direction);
 
     /* set iterator parameter */
-    if (laneScan == NULL) {
+    if (wiseScan == NULL) {
         SetPartitionIteratorParamter(node, subPartLengthList);
     }
 
@@ -204,9 +283,10 @@ VectorBatch* ExecVecPartIterator(VecPartIteratorState* node)
     }
 
     /* init first scanned partition */
-    if (-1 == node->currentItr)
-        InitVecscanPartition(node, partitionScan);
-
+    // if (-1 == node->currentItr)
+    //     InitVecscanPartition(node, partitionScan);
+    if (-1 == node->currentItr && !InitVecscanPartition(node, partitionScan))
+        return NULL; /* An idle worker must not read the initially opened partition. */
     /* For partition wise join, can not early free left tree's caching memory */
     state->es_skip_early_free = true;
     result = VectorEngine(node->ps.lefttree);
@@ -255,6 +335,7 @@ void ExecReScanVecPartIterator(VecPartIteratorState* node)
     }
 
     node->currentItr = -1;
+    pfree_ext(node->partitionWiseWorkers); /* Rebuild from this scan's current pruning list. */
 
     pi_node = (VecPartIterator*)node->ps.plan;
     paramno = pi_node->param->paramno;

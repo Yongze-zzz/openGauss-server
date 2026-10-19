@@ -34,6 +34,7 @@
 #include "access/htap/imcs_ctlg.h"
 #include "access/htap/imcs_hash_table.h"
 #include "access/htap/imcucache_mgr.h"
+#include "access/htap/imcs_partition_wise.h"
 
 static void CreateIMCUDir(const char* path);
 static void CreateIMCUDirAndClearCUFiles();
@@ -230,6 +231,8 @@ void IMCUDataCacheMgr::BaseCacheCU(CU* srcCU, CU* slotCU)
     slotCU->m_cache_compressed = srcCU->m_cache_compressed;
     slotCU->m_inCUCache = true;
     slotCU->m_numericIntLike = srcCU->m_numericIntLike;
+    slotCU->m_partitionWiseBuffer = srcCU->m_partitionWiseBuffer;
+    slotCU->m_partitionWiseBufferSize = srcCU->m_partitionWiseBufferSize;
 }
  
 void IMCUDataCacheMgr::CacheCU(CU* srcCU, CU* slotCU)
@@ -277,7 +280,8 @@ void IMCUDataCacheMgr::SaveCU(IMCSDesc* imcsDesc, RelFileNodeOld* rnode, int col
         return;
     }
     DataSlotTag slotTag = InitCUSlotTag(rnode, colId, cuDescPtr->cu_id, cuDescPtr->cu_pointer);
-
+    /* Bind before publishing a cache slot; native error cleanup still owns cuPtr. */
+    ImcsPartitionWisePlaceCU(cuPtr, imcsDesc->dataNumaNode);
 RETRY_RESERVE_DATABLOCK:
     bool hasFound = false;
     CacheSlotId_t slotId = ReserveDataBlock(&slotTag, cuDescPtr->cu_size, hasFound);
@@ -293,6 +297,8 @@ RETRY_RESERVE_DATABLOCK:
         }
     } else {
         CacheCU(cuPtr, slotCU);
+        if (slotCU->m_partitionWiseBuffer != NULL)
+            m_cache_mgr->AdjustCacheMem(slotId, cuDescPtr->cu_size, slotCU->GetUncompressBufSize());
     }
 
     slotCU->imcsDesc = imcsDesc;

@@ -1,1 +1,1 @@
-/home/yanyz/olap/openGauss-server/./src/gausskernel/storage/access/redo/xlogreader_common.cpp
+/mnt/nvme1p1/yanyz/openGauss-server/./src/gausskernel/storage/access/redo/xlogreader_common.cpp
