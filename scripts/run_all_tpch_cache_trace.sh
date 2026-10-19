@@ -3,16 +3,16 @@ set -uo pipefail
 
 DB_NAME="${DB_NAME:-tpch}"
 PORT="${PORT:-19999}"
-PGDATA="${PGDATA:-/mnt/nvme1p1/yanyz/data}"
+PGDATA="${PGDATA:-/mnt/nvme1p1/users/data}"
 CONF_FILE="${PGDATA}/postgresql.conf"
-SQL_DIR="${SQL_DIR:-/mnt/nvme1p1/yanyz/TPCH-openGauss-TestTools/SQL/queries}"
+SQL_DIR="${SQL_DIR:-/mnt/nvme1p1/users/TPCH-openGauss-TestTools/SQL/queries}"
 DOP="${DOP:-192}"
 RUNS="${RUNS:-1}"
 INTERVAL_US="${OG_CACHE_TRACE_INTERVAL_US:-10000}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/nvme1p1/yanyz/tpch_cache_trace_all_dop${DOP}_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/nvme1p1/users/tpch_cache_trace_all_dop${DOP}_$(date +%Y%m%d_%H%M%S)}"
 PG_LOG_DIR="${PGDATA}/pg_log"
 BINARY_SPOOL="${PG_LOG_DIR}/cache_trace"
-GAUSSDB_BIN="/home/yanyz/olap/openGauss-server/mppdb_temp_install/bin/gaussdb"
+GAUSSDB_BIN="/home/users/olap/openGauss-server/mppdb_temp_install/bin/gaussdb"
 
 case "$DOP" in
     24)
