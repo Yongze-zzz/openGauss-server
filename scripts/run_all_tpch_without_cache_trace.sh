@@ -3,9 +3,9 @@ set -uo pipefail
 
 DB_NAME="${DB_NAME:-tpch}"
 PORT="${PORT:-19999}"
-PGDATA="${PGDATA:-/mnt/nvme1p1/yanyz/data}"
+PGDATA="${PGDATA:-/mnt/nvme1p1/user/data}"
 CONF_FILE="${PGDATA}/postgresql.conf"
-SQL_DIR="${SQL_DIR:-/mnt/nvme1p1/yanyz/TPCH-openGauss-TestTools/SQL/queries}"
+SQL_DIR="${SQL_DIR:-/mnt/nvme1p1/user/TPCH-openGauss-TestTools/SQL/queries}"
 DOP="${DOP:-192}"
 RUNS="${RUNS:-5}"
 RUN_GAP_SECONDS="${RUN_GAP_SECONDS:-3}"
@@ -14,8 +14,8 @@ END_QUERY="${END_QUERY:-22}"
 START_RUN="${START_RUN:-1}"
 END_RUN="${END_RUN:-$RUNS}"
 APPEND_RESULTS="${APPEND_RESULTS:-0}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/nvme1p1/yanyz/tpch_cache_wo_trace_all_dop${DOP}_$(date +%Y%m%d_%H%M%S)}"
-GAUSSDB_BIN="/home/yanyz/olap/openGauss-server/mppdb_temp_install/bin/gaussdb"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/nvme1p1/user/tpch_cache_wo_trace_all_dop${DOP}_$(date +%Y%m%d_%H%M%S)}"
+GAUSSDB_BIN="/home/user/olap/openGauss-server/mppdb_temp_install/bin/gaussdb"
 
 case "$DOP" in
     48)
