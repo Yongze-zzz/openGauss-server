@@ -33,6 +33,7 @@
 #include "utils/memprot.h"
 #include "utils/datum.h"
 #include "vecexecutor/vectorbatch.h"
+#include "vecexecutor/operator_data_access.h"
 #include "workload/workload.h"
 
 /* BatchStore is an opaque type whose details are not known outside
@@ -128,6 +129,13 @@ public:
             m_colWidth += batch->m_cols * sizeof(Datum) + batch->m_cols * sizeof(uint8);
         multiColValue.size = 0;
         uint8 flag;
+#ifdef ENABLE_HTAP
+        OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+        if (dataAccess != NULL) {
+            dataAccess->Observe(multiColValue.m_values, batch->m_cols * sizeof(Datum), DA_STATE, DA_WRITE);
+            dataAccess->Observe(multiColValue.m_nulls, batch->m_cols * sizeof(uint8), DA_STATE, DA_WRITE);
+        }
+#endif
 
         /*
          * When faced with NULL, we just skip, in the following produce, we do the same thing.
@@ -153,6 +161,10 @@ public:
                     if (m_addWidth)
                         m_colWidth += typlen;
                     char* p = DatumGetPointer(multiColValue.m_values[col]);
+#ifdef ENABLE_HTAP
+                    if (dataAccess != NULL)
+                        dataAccess->Observe(p, typlen, DA_STATE, DA_WRITE);
+#endif
                     UseMem(GetMemoryChunkSpace(p));
                     multiColValue.size += datumGetSize(v, attr->attbyval, typlen);
                 } else {

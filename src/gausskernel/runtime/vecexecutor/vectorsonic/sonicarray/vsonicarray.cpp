@@ -27,6 +27,7 @@
 #include "vectorsonic/vsonicarray.h"
 #include "utils/dynahash.h"
 #include "vectorsonic/vsonicfilesource.h"
+#include "vecexecutor/operator_data_access.h"
 
 /*
  * @Description: Get the data length.
@@ -277,11 +278,23 @@ void SonicDatumArray::putArray(ScalarValue* vals, uint8* flag, int rows)
     loop_rows = need_expand ? (m_atomSize - m_atomIdx) : rows;
 
     if (loop_rows > 0) {
+#ifdef ENABLE_HTAP
+        int accessBegin = m_atomIdx;
+#endif
         /* set with checking flag */
         putDatumArrayWithNullCheck(vals, flag, loop_rows);
         if (m_nullFlag)
             putNullFlagArray(flag, loop_rows);
         m_atomIdx += loop_rows;
+#ifdef ENABLE_HTAP
+        OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+        if (dataAccess != NULL) {
+            dataAccess->Observe(m_curAtom->data + (Size)accessBegin * m_atomTypeSize,
+                (Size)loop_rows * m_atomTypeSize, DA_STATE, DA_WRITE);
+            if (m_nullFlag)
+                dataAccess->Observe(m_curAtom->nullFlag + accessBegin, loop_rows, DA_STATE, DA_WRITE);
+        }
+#endif
     }
 
     if (need_expand) {
@@ -389,6 +402,11 @@ int64 SonicDatumArray::getRows()
  */
 void SonicDatumArray::getNthDatumFlag(uint32 nth, ScalarValue* val, uint8* to_flag)
 {
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+    if (dataAccess != NULL)
+        dataAccess->ObserveSonic(this, nth, DA_READ);
+#endif
     int arrIndx;
     int atomIndx;
 
@@ -406,6 +424,11 @@ void SonicDatumArray::getNthDatumFlag(uint32 nth, ScalarValue* val, uint8* to_fl
  */
 Datum SonicDatumArray::getNthDatum(uint32 nth)
 {
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+    if (dataAccess != NULL)
+        dataAccess->ObserveSonic(this, nth, DA_READ);
+#endif
     int arrIndx;
     int atomIndx;
 

@@ -72,6 +72,9 @@
 #include "utils/guc_tables.h"
 #include "utils/snapmgr.h"
 #include "vecexecutor/vecstream.h"
+#ifdef ENABLE_HTAP
+#include "vecexecutor/operator_data_access.h"
+#endif
 
 extern void StreamSaveTxnContext(StreamTxnContext* stc);
 extern void StreamRestoreTxnContext(StreamTxnContext* stc);
@@ -1052,6 +1055,27 @@ void StreamProducer::localRedistributeStream(VectorBatch* batch)
     Assert(m_sharedContext != NULL);
 
     (this->*m_channelCalVecFun)(batch);
+
+#ifdef ENABLE_HTAP
+    if (unlikely(u_sess->attr.attr_sql.enable_inter_operator_data_access)) {
+        OperatorDataAccessStreamBatch dataAccess(m_connNum);
+        PG_TRY();
+        {
+            for (int i = 0; i < batch->m_rows; i++)
+                sendByMemory(NULL, batch, m_locator[i], i);
+            /* Source addresses remain valid until this input batch returns. */
+            dataAccess.Close();
+        }
+        PG_CATCH();
+        {
+            /* An interrupted copy may already have invalidated some recorded addresses. */
+            dataAccess.Close(true);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        return;
+    }
+#endif
 
     for (int i = 0; i < batch->m_rows; i++) {
         sendByMemory(NULL, batch, m_locator[i], i);

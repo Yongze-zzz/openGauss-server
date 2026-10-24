@@ -22,6 +22,7 @@
  * ---------------------------------------------------------------------------------------
  */
 #include "vecexecutor/vectorbatch.h"
+#include "vecexecutor/operator_data_access.h"
 #include "vecexecutor/vecvar.h"
 #include "vecexecutor/vectorbatch.inl"
 #include "lib/stringinfo.h"
@@ -511,6 +512,10 @@ void VectorBatch::DeserializeWithLZ4Decompress(char* msg, size_t msg_len)
 
 void VectorBatch::Reset(bool reset_flag)
 {
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessFlushPending();
+#endif
     errno_t rc;
     m_rows = 0;
     for (int i = 0; i < m_cols; i++) {
@@ -631,13 +636,17 @@ int VectorBatch::GetSysColumnNum()
     return m_sysColumns ? m_sysColumns->sysColumns : 0;
 }
 
-void VectorBatch::CopyNth(VectorBatch* batch, int nth)
+void VectorBatch::CopyNth(VectorBatch* batch, int nth, bool trackDataAccess)
 {
     for (int i = 0; i < m_cols; i++) {
         m_arr[i].copyNth(&batch->m_arr[i], nth);
     }
 
     m_rows++;
+#ifdef ENABLE_HTAP
+    if (trackDataAccess && unlikely(operator_data_access_active))
+        OperatorDataAccessBatchCopy(batch, this, nth, m_rows - 1, 1, true, true);
+#endif
 }
 
 Datum ScalarVector::AddVar(Datum data, int aindex)
@@ -1162,6 +1171,10 @@ varBuf* VarBuf::CreateBuf(int data_len)
 
 void VarBuf::DeInit(bool needfree)
 {
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessFlushPending();
+#endif
     varBuf* buf = m_head;
     varBuf* last_buf = NULL;
 

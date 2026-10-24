@@ -26,6 +26,7 @@
  * -------------------------------------------------------------------------
  */
 #include "vectorsonic/vsonicpartition.h"
+#include "vecexecutor/operator_data_access.h"
 #include "storage/buf/buffile.h"
 #include "storage/lz4_file.h"
 #include "vectorsonic/vsonicnumeric.h"
@@ -300,9 +301,9 @@ void SonicHashMemPartition::freeResources()
 {
     if (m_context != NULL) {
         /* reset the m_context */
-        MemoryContextReset(m_context);
+        MemoryContextReset(OperatorDataAccessReleaseContext(m_context));
         /* Delete child context for m_hashContext */
-        MemoryContextDelete(m_context);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_context));
         m_context = NULL;
     }
 }
@@ -660,9 +661,9 @@ void SonicHashFilePartition::freeResources()
 
     if (m_context != NULL) {
         /* reset the m_context */
-        MemoryContextReset(m_context);
+        MemoryContextReset(OperatorDataAccessReleaseContext(m_context));
         /* Delete child context for m_hashContext */
-        MemoryContextDelete(m_context);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_context));
         m_context = NULL;
     }
 }
@@ -745,9 +746,9 @@ void SonicSortPartition::freeResources()
     }
     if (m_context != NULL) {
         /* reset the m_context */
-        MemoryContextReset(m_context);
+        MemoryContextReset(OperatorDataAccessReleaseContext(m_context));
         /* Delete child context for m_hashContext */
-        MemoryContextDelete(m_context);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_context));
         m_context = NULL;
     }
 }

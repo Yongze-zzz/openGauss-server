@@ -259,6 +259,8 @@ const char* sync_guc_variable_namelist[] = {"work_mem",
 #ifdef ENABLE_HTAP
     "enable_imcs_partition_scan",
     "enable_numa_aware_partition_scan",
+    "enable_intra_operator_data_access",
+    "enable_inter_operator_data_access",
     "imcs_partition_scan_cpus",
     "imcs_partition_numa_map",
 #endif

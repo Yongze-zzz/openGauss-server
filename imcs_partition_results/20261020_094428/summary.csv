@@ -1,0 +1,7 @@
+mode,query,run,elapsed_ms,log
+partition,1,1,9039.067,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q1_1.log
+partition,1,2,10356.566,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q1_2.log
+partition,1,3,10544.683,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q1_3.log
+partition,6,1,480.669,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q6_1.log
+partition,6,2,435.293,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q6_2.log
+partition,6,3,484.370,/mnt/nvme1p1/yanyz/openGauss-server/imcs_partition_results/20261020_094428/partition/q6_3.log

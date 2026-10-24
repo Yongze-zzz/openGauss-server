@@ -55,6 +55,9 @@
 #include "utils/dynahash.h"
 
 #include "vecexecutor/vectorbatch.h"
+#ifdef ENABLE_HTAP
+#include "vecexecutor/operator_data_access.h"
+#endif
 #include "vecexecutor/vecnodes.h"
 #include "executor/exec/execStream.h"
 #include "miscadmin.h"
@@ -237,18 +240,29 @@ void gs_memory_send(
     if (sharedContext->vectorized) {
         Assert(sharedContext->sharedBatches != NULL);
         batch = sharedContext->sharedBatches[nthChannel][u_sess->stream_cxt.smp_id];
+#ifdef ENABLE_HTAP
+        int dataAccessTargetBegin = batch->m_rows;
+#endif
         /* data copy */
         if (-1 == nthRow) {
             /* Do deep copy of all rows, for local roundrobin & local broadcast. */
             Assert(batch->m_rows == 0);
-            batch->Copy<true, false>(batchsrc);
+            // batch->Copy<true, false>(batchsrc);
+            batch->Copy<true, false>(batchsrc, 0, -1, false);
             ready_to_send = true;
         } else {
-            batch->CopyNth(batchsrc, nthRow);
+            // batch->CopyNth(batchsrc, nthRow);
+            batch->CopyNth(batchsrc, nthRow, false);
             if (BatchMaxSize == batch->m_rows) {
                 ready_to_send = true;
             }
         }
+#ifdef ENABLE_HTAP
+        if (unlikely(u_sess->attr.attr_sql.enable_inter_operator_data_access))
+            OperatorDataAccessStreamCopy(batchsrc, batch, nthRow < 0 ? 0 : nthRow, dataAccessTargetBegin,
+                nthRow < 0 ? batchsrc->m_rows : 1, nthRow >= 0, true,
+                sharedContext->key_s.planNodeId, nthChannel, ready_to_send);
+#endif
     } else {
         Assert(sharedContext->sharedTuples != NULL);
         tupleVec = sharedContext->sharedTuples[nthChannel][u_sess->stream_cxt.smp_id];
@@ -322,8 +336,13 @@ bool gs_consume_memory_data(StreamState* node, int loc)
             return false;
         }
 
-        batchdst->Copy<true, false>(batchsrc);
-
+        // batchdst->Copy<true, false>(batchsrc);
+        batchdst->Copy<true, false>(batchsrc, 0, -1, false);
+#ifdef ENABLE_HTAP
+        if (unlikely(u_sess->attr.attr_sql.enable_inter_operator_data_access))
+            OperatorDataAccessStreamCopy(batchsrc, batchdst, 0, 0, batchsrc->m_rows, false,
+                false, sharedContext->key_s.planNodeId, loc);
+#endif
         batchsrc->Reset();
     } else {
         TupleVector* tuplesrc = sharedContext->sharedTuples[u_sess->stream_cxt.smp_id][loc];

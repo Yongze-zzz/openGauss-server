@@ -27,10 +27,19 @@
 
 #include "fmgr.h"
 #include "vecexecutor/vectorbatch.h"
+#ifdef ENABLE_HTAP
+#include "vecexecutor/operator_data_access.h"
+#define VectorExprEngine(expr, econtext, selVector, inputVector, isDone) \
+    ((expr)->vecExprFun ? (unlikely(operator_data_access_active) ? \
+        OperatorDataAccessEval(expr, econtext, selVector, inputVector, isDone) : \
+        (*(expr)->vecExprFun)(expr, econtext, selVector, inputVector, isDone)) : \
+        (elog(ERROR, "Unsupported expressions for vector engine"), ((ScalarVector*)NULL)))
+#else
 
 #define VectorExprEngine(expr, econtext, selVector, inputVector, isDone)                        \
     ((expr)->vecExprFun ? (*(expr)->vecExprFun)(expr, econtext, selVector, inputVector, isDone) \
                         : (elog(ERROR, "Unsupported expressions for vector engine"), ((ScalarVector*)NULL)))
+#endif
 
 GenericArgExtract ChooseExtractFun(Oid Dtype, Oid fn_oid = 0);
 

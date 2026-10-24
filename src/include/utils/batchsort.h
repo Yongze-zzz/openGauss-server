@@ -227,6 +227,20 @@ public:
 
     int HeapCompare(MultiColumns* a, MultiColumns* b, bool checkIdx);
 
+#ifdef ENABLE_HTAP
+    void ObserveJitComparison(const MultiColumns* a, const MultiColumns* b);
+#endif
+    int CompareMultiColumnWithDataAccess(const MultiColumns* a, const MultiColumns* b)
+    {
+#ifdef ENABLE_HTAP
+        if (unlikely(operator_data_access_active) &&
+            ((char*)compareMultiColumn == jitted_CompareMultiColumn ||
+             (char*)compareMultiColumn == jitted_CompareMultiColumn_TOPN))
+            ObserveJitComparison(a, b);
+#endif
+        return compareMultiColumn(a, b, this);
+    }
+
     template <bool checkIdx>
     int THeapCompare(MultiColumns* a, MultiColumns* b);
 
@@ -348,6 +362,11 @@ extern void batchsort_set_bound(Batchsortstate* state, int64 bound);
 template <bool abbrevSortOptimize>
 void putbatch(Batchsortstate* state, VectorBatch* batch, int start, int end)
 {
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        for (int col = 0; col < batch->m_cols; ++col)
+            OperatorDataAccessReadVector(&batch->m_arr[col], NULL, start, end);
+#endif
     int64 memorySize = 0;
     for (int row = start; row < end; ++row) {
         MultiColumns multiColumn = state->CopyMultiColumn<abbrevSortOptimize>(batch, row);
@@ -492,7 +511,7 @@ void putbatch(Batchsortstate* state, VectorBatch* batch, int start, int end)
 
             case BS_BOUNDED:
 
-                if (state->compareMultiColumn(&multiColumn, state->m_storeColumns.m_memValues, state) <= 0) {
+                if (state->CompareMultiColumnWithDataAccess(&multiColumn, state->m_storeColumns.m_memValues) <= 0) {
                     state->FreeMultiColumn(&multiColumn);
                 } else {
                     state->FreeMultiColumn(state->m_storeColumns.m_memValues);
@@ -503,7 +522,7 @@ void putbatch(Batchsortstate* state, VectorBatch* batch, int start, int end)
 
             case BS_BUILDRUNS:
 
-                if (state->compareMultiColumn(&multiColumn, &state->m_storeColumns.m_memValues[0], state) >= 0) {
+                if (state->CompareMultiColumnWithDataAccess(&multiColumn, &state->m_storeColumns.m_memValues[0]) >= 0) {
                     state->BatchSortHeapInsert<true>(&multiColumn, state->m_curRun);
                 } else {
                     state->BatchSortHeapInsert<true>(&multiColumn, state->m_curRun + 1);

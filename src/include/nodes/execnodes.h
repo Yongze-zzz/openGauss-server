@@ -668,6 +668,9 @@ typedef struct EState {
 
     /* Other working state: */
     MemoryContext es_query_cxt;       /* per-query context in which EState lives */
+#ifdef ENABLE_HTAP
+    struct OperatorDataAccessStats* es_operator_data_access; /* Allocated in es_query_cxt. */
+#endif
     MemoryContext es_const_query_cxt; /* const per-query context used to create node context */
 
     List* es_tupleTable; /* List of TupleTableSlots */

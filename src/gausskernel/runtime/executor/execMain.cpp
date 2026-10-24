@@ -41,6 +41,9 @@
 #include "codegen/gscodegen.h"
 
 #include "postgres.h"
+#ifdef ENABLE_HTAP
+#include "vecexecutor/operator_data_access.h"
+#endif
 #include "knl/knl_variable.h"
 
 #include "access/htup.h"
@@ -2092,7 +2095,10 @@ void ExecEndPlan(PlanState *planstate, EState *estate)
     }
 
     //add cache trace function
-    VecCacheTraceFlush();
+    // VecCacheTraceFlush();
+#ifdef ENABLE_HTAP
+    OperatorDataAccessFlush(estate);
+#endif
     // VecEngineProfileFlush();
 
     /*
@@ -2507,6 +2513,24 @@ static void ExecuteVectorizedPlan(EState *estate, PlanState *planstate, CmdType 
          * practice, this is probably always the case at this point.)
          */
         if (sendTuples && !u_sess->exec_cxt.executorStopFlag) {
+#ifdef ENABLE_HTAP
+            /* Stream send callbacks run after VectorEngine has returned its root batch. */
+            if (unlikely(u_sess->attr.attr_sql.enable_inter_operator_data_access)) {
+                OperatorDataAccessFrame frame;
+                OperatorDataAccessEnter(&frame, planstate);
+                PG_TRY();
+                {
+                    (*dest->sendBatch)(batch, dest);
+                }
+                PG_CATCH();
+                {
+                    OperatorDataAccessRestore(&frame, true);
+                    PG_RE_THROW();
+                }
+                PG_END_TRY();
+                OperatorDataAccessRestore(&frame);
+            } else
+#endif
             (*dest->sendBatch)(batch, dest);
         }
 

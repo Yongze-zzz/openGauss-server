@@ -34,6 +34,7 @@
 #include "vectorsonic/vsonicchar.h"
 #include "vectorsonic/vsonicencodingchar.h"
 #include "vectorsonic/vsonicfixlen.h"
+#include "vecexecutor/operator_data_access.h"
 
 #define PROBE_FETCH 0
 #define PROBE_PARTITION_FILE 1
@@ -166,6 +167,11 @@ public:
 
     inline void hashBatchArray(VectorBatch* batch, void* hashFun, FmgrInfo* hashFmgr, uint16* keyIndx, uint32* hashRes)
     {
+#ifdef ENABLE_HTAP
+        if (unlikely(operator_data_access_active))
+            for (int key = 0; key < m_buildOp.keyNum; ++key)
+                OperatorDataAccessReadVector(&batch->m_arr[keyIndx[key]], NULL, 0, batch->m_rows);
+#endif
         int i;
         AutoContextSwitch memGuard(m_memControl.tmpContext);
         hashValFun* hashfun = (hashValFun*)hashFun;
@@ -177,7 +183,7 @@ public:
                 hashRes,
                 (hashFmgr + i));
 
-        MemoryContextReset(m_memControl.tmpContext);
+        MemoryContextReset(OperatorDataAccessReleaseContext(m_memControl.tmpContext));
     }
 
     inline void hashAtomArray(SonicDatumArray** array, int nrows, int arrIdx, void* hashFun, FmgrInfo* hashFmgr,
@@ -194,7 +200,7 @@ public:
                 (char*)datum_arr->data, (uint8*)datum_arr->nullFlag, nrows, hashRes, (hashFmgr + i));
         }
 
-        MemoryContextReset(m_memControl.tmpContext);
+        MemoryContextReset(OperatorDataAccessReleaseContext(m_memControl.tmpContext));
     }
 
     template <typename innerType, typename outerType, bool simpleType, bool nulleqnull>

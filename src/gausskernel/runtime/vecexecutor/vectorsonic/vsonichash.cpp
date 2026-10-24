@@ -24,6 +24,7 @@
  * -------------------------------------------------------------------------
  */
 #include "c.h"
+#include "vecexecutor/operator_data_access.h"
 #include "catalog/pg_type.h"
 #include "storage/compress_kits.h"
 #include "vectorsonic/vsonichash.h"
@@ -37,6 +38,22 @@
 #endif
 
 extern bool anls_opt_is_on(AnalysisOpt dfx_opt);
+
+#ifdef ENABLE_HTAP
+/* Resolve one logical SonicDatumArray slot to the data and null pages it touches. */
+void OperatorDataAccessScope::ObserveSonic(SonicDatumArray* array, uint32 index, OperatorDataAccessKind access)
+{
+    if (!Enabled() || array == NULL)
+        return;
+    uint32 atomIndex = getArrayIndx(index, array->m_nbit);
+    uint32 offset = getArrayLoc(index, array->m_atomSize - 1);
+    Assert(atomIndex <= (uint32)array->m_arrIdx && array->m_arr[atomIndex] != NULL);
+    atom* storage = array->m_arr[atomIndex];
+    Observe(storage->data + (Size)offset * array->m_atomTypeSize, array->m_atomTypeSize, DA_STATE, access);
+    if (storage->nullFlag != NULL)
+        Observe(storage->nullFlag + offset, sizeof(uint8), DA_STATE, access);
+}
+#endif
 
 #define HASH_RANDOM_1 1.0412321
 #define HASH_RANDOM_2 1.1131347
@@ -617,12 +634,12 @@ void SonicHash::freeMemoryContext()
 {
     if (m_memControl.hashContext != NULL) {
         /* Delete child context for m_hashContext */
-        MemoryContextDelete(m_memControl.hashContext);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_memControl.hashContext));
         m_memControl.hashContext = NULL;
     }
     if (m_memControl.tmpContext != NULL) {
         /* Delete child context for m_hashContext */
-        MemoryContextDelete(m_memControl.tmpContext);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_memControl.tmpContext));
         m_memControl.tmpContext = NULL;
     }
 }

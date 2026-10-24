@@ -31,7 +31,7 @@
 #include "utils/elog.h"
 #include "utils/dynahash.h"
 #include "utils/int8.h"
-
+#include "vecexecutor/operator_data_access.h"
 /*
  * @Description	: Check if current aggref's expression is supported or not.
  * @in node		: Aggref's expression node.
@@ -912,7 +912,7 @@ bool SonicHashAgg::ResetNecessary(VecAggState* node)
     m_runState = AGG_PREPARE;
 
     /* Reset context */
-    MemoryContextResetAndDeleteChildren(m_memControl.hashContext);
+    MemoryContextResetAndDeleteChildren(OperatorDataAccessReleaseContext(m_memControl.hashContext));
     /* Rebuild initial hash table */
     {
         AutoContextSwitch memSwitch(m_memControl.hashContext);
@@ -1168,7 +1168,7 @@ SonicHashSource* SonicHashAgg::GetHashSource()
                 m_rows = 0;
 
                 /* reset context to free the memory */
-                MemoryContextResetAndDeleteChildren(m_memControl.hashContext);
+                MemoryContextResetAndDeleteChildren(OperatorDataAccessReleaseContext(m_memControl.hashContext));
 
                 /* recompute hash table size and initialize hash structure, since we have already
                  * do reset in FilePartition for batch, so not need to reset partition context here.
@@ -1415,6 +1415,11 @@ void SonicHashAgg::buildAggTblBatch(VectorBatch* batch)
     uint32 data_loc;
     uint32 current_loc;
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
     INSTR_TIME_SET_CURRENT(start_time);
 
     /* the hash table may be resized yet */
@@ -1440,6 +1445,10 @@ void SonicHashAgg::buildAggTblBatch(VectorBatch* batch)
 #endif
 
         if (!useSegHashTable) {
+#ifdef ENABLE_HTAP
+            if (dataAccess != NULL)
+                dataAccess->Observe(&((uint32*)m_bucket)[hash_loc], sizeof(uint32), DA_STATE, DA_READ);
+#endif
             data_loc = ((uint32*)m_bucket)[hash_loc];
         } else {
             data_loc = (uint32)m_segBucket->getNthDatum(hash_loc);
@@ -1505,6 +1514,11 @@ void SonicHashAgg::buildAggTblBatch(VectorBatch* batch)
 
         /* The actual value pos recorded in hash table */
         if (!useSegHashTable) {
+#ifdef ENABLE_HTAP
+            if (dataAccess != NULL)
+                dataAccess->Observe(&((uint32*)m_bucket)[m_bucketLoc[cmpBatchIdx]],
+                    sizeof(uint32), DA_STATE, DA_READ);
+#endif
             current_loc = ((uint32*)m_bucket)[m_bucketLoc[cmpBatchIdx]];
         } else {
             current_loc = (uint32)m_segBucket->getNthDatum(m_bucketLoc[cmpBatchIdx]);
@@ -1546,6 +1560,24 @@ void SonicHashAgg::buildAggTblBatch(VectorBatch* batch)
 
     INSTR_TIME_SET_CURRENT(start_time);
     if (m_runtime->jitted_sonicbatchagg) {
+#ifdef ENABLE_HTAP
+        if (unlikely(operator_data_access_active))
+            for (int aggregate = 0; aggregate < m_aggNum; ++aggregate)
+                OperatorDataAccessJitBatch(&m_runtime->ss.ps, batch,
+                    m_runtime->pervecagg[m_aggNum - 1 - aggregate].aggref->args);
+        if (unlikely(u_sess->attr.attr_sql.enable_intra_operator_data_access)) {
+            OperatorDataAccessScope state(&m_runtime->ss.ps, DA_SONIC_AGG_JIT_CANDIDATE, batch->m_rows);
+            for (int aggregate = 0; aggregate < m_aggNum; ++aggregate) {
+                int slots = m_runtime->aggInfo[aggregate].vec_final_function.flinfo != NULL ? 2 : 1;
+                for (int row = 0; row < batch->m_rows; ++row)
+                    if (m_loc[row] != 0)
+                        for (int slot = 0; slot < slots; ++slot) {
+                            state.ObserveSonic(m_data[m_aggIdx[aggregate] + slot], m_loc[row], DA_READ);
+                            state.ObserveSonic(m_data[m_aggIdx[aggregate] + slot], m_loc[row], DA_WRITE);
+                        }
+            }
+        }
+#endif
         if (HAS_INSTR(&m_runtime->ss, false)) {
             m_runtime->ss.ps.instrument->isLlvmOpt = true;
         }
@@ -1569,6 +1601,11 @@ int64 SonicHashAgg::insertHashTbl(VectorBatch* batch, int idx, uint32 hashval, u
     int i;
     int64 extra_size_needed = 0;
     ScalarVector* scalar_vec = NULL;
+
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
 
     m_rows++;
 
@@ -1602,7 +1639,15 @@ int64 SonicHashAgg::insertHashTbl(VectorBatch* batch, int idx, uint32 hashval, u
 
     /* update hash table */
     if (likely(!m_useSegHashTbl)) {
+#ifdef ENABLE_HTAP
+        if (dataAccess != NULL)
+            dataAccess->Observe(&((uint32*)m_bucket)[hashLoc], sizeof(uint32), DA_STATE, DA_READ);
+#endif
         m_next->putArray((Datum*)&(((uint32*)m_bucket)[hashLoc]), NULL, 1);
+#ifdef ENABLE_HTAP
+        if (dataAccess != NULL)
+            dataAccess->Observe(&((uint32*)m_bucket)[hashLoc], sizeof(uint32), DA_STATE, DA_WRITE);
+#endif
         ((uint32*)m_bucket)[hashLoc] = m_rows;
     } else {
         uint32 bucket_pos = (uint32)m_segBucket->getNthDatum(hashLoc);
@@ -2087,6 +2132,11 @@ void SonicHashAgg::expandHashTable()
     int64 rows_num = 0;
     errno_t rc = 0;
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
     /* fack case : no data left in hash table */
     if (m_rows == 0) {
         return;
@@ -2169,7 +2219,15 @@ void SonicHashAgg::expandHashTable()
 #endif
 
         if (likely(!m_useSegHashTbl)) {
+#ifdef ENABLE_HTAP
+            if (dataAccess != NULL)
+                dataAccess->Observe(&((uint32*)m_bucket)[hash_loc], sizeof(uint32), DA_STATE, DA_READ);
+#endif
             m_next->putArray((Datum*)&(((uint32*)m_bucket)[hash_loc]), NULL, 1);
+#ifdef ENABLE_HTAP
+            if (dataAccess != NULL)
+                dataAccess->Observe(&((uint32*)m_bucket)[hash_loc], sizeof(uint32), DA_STATE, DA_WRITE);
+#endif
             ((uint32*)m_bucket)[hash_loc] = rows_num;
         } else {
             uint32 bucketPos = (uint32)m_segBucket->getNthDatum(hash_loc);
@@ -2211,7 +2269,7 @@ void SonicHashAgg::resetVariableMemberIfNecessary(int partNum)
      */
     for (int i = 0; i < m_partNum; i++) {
         if (m_partFileSource[i]->m_context != NULL) {
-            MemoryContextReset(m_partFileSource[i]->m_context);
+            MemoryContextReset(OperatorDataAccessReleaseContext(m_partFileSource[i]->m_context));
         }
     }
 
@@ -2284,7 +2342,29 @@ void SonicHashAgg::AggregationOnScalar(VecAggInfo* aggInfo, ScalarVector* pVecto
     fcinfo->arg[2] = (Datum)m_loc;
     fcinfo->arg[3] = (Datum)m_data;
 
-    VecFunctionCallInvoke(fcinfo);
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active)) {
+        int aggregate = (int)(aggInfo - m_runtime->aggInfo);
+        int rows = pVector->m_rows;
+        if (m_runtime->pervecagg[m_aggNum - 1 - aggregate].evalproj != NULL)
+            OperatorDataAccessReadVector(pVector);
+        OperatorDataAccessScope dataAccess(&m_runtime->ss.ps, DA_SONIC_AGG_TRANSITION, rows);
+        int slots = aggInfo->vec_final_function.flinfo != NULL ? 2 : 1;
+        if (dataAccess.Enabled())
+            for (int row = 0; row < rows; ++row)
+                if (m_loc[row] != 0)
+                    for (int slot = 0; slot < slots; ++slot)
+                        dataAccess.ObserveSonic(m_data[idx + slot], m_loc[row], DA_READ);
+        dataAccess.Flush();
+        VecFunctionCallInvoke(fcinfo);
+        if (dataAccess.Enabled())
+            for (int row = 0; row < rows; ++row)
+                if (m_loc[row] != 0)
+                    for (int slot = 0; slot < slots; ++slot)
+                        dataAccess.ObserveSonic(m_data[idx + slot], m_loc[row], DA_WRITE);
+    } else
+#endif
+        VecFunctionCallInvoke(fcinfo);
     ResetExprContext(m_econtext);
 }
 

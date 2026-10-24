@@ -3305,7 +3305,10 @@ ScalarVector* ExecVecQual(List* qual, ExprContext* econtext, bool resultForNull,
             ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("Invalid clause in qual")));
 
         qual_result = VectorExprEngine(clause, econtext, econtext->ecxt_scanbatch->m_sel, pVector, NULL);
-
+#ifdef ENABLE_HTAP
+        if (unlikely(operator_data_access_active))
+            OperatorDataAccessReadVector(qual_result, econtext->ecxt_scanbatch->m_sel, 0, rows);
+#endif
         rows = qual_result->m_rows;
         pVal = qual_result->m_vals;
         pFlag = qual_result->m_flag;
@@ -3664,6 +3667,15 @@ VectorBatch* ExecVecProject(ProjectionInfo* projInfo, bool selReSet, ExprDoneCon
     /* If there are any generic expressions, evaluate them. */
     if (projInfo->pi_targetlist) {
         if (projInfo->jitted_vectarget) {
+#ifdef ENABLE_HTAP
+            if (unlikely(operator_data_access_active)) {
+                ListCell* accessCell = NULL;
+                foreach (accessCell, projInfo->pi_targetlist) {
+                    ExprState* accessExpr = (ExprState*)lfirst(accessCell);
+                    OperatorDataAccessJitInputs(OperatorDataAccessCurrentNode(), accessExpr->expr, econtext);
+                }
+            }
+#endif
             projInfo->jitted_vectarget(econtext, pProjBatch);
         } else {
             if (econtext->have_vec_set_fun) {

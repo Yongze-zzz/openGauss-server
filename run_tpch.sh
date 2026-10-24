@@ -15,8 +15,8 @@ export PORT=${PORT:-${PGPORT:-19999}}
 # The existing .tbl files are in the dbgen directory. Override DATA_DIR for other data.
 export DATA_DIR=${DATA_DIR:-${DBGEN_DIR:-${TPCH_ROOT:-/mnt/nvme1p1/yanyz/TPCH-openGauss-TestTools}/TPC-H_Tools_v3.0.0/dbgen}}
 
-bash "$source_dir/build_test_imcs.sh" all
-bash "$source_dir/prepare_tpch_imcs.sh" create
-bash "$source_dir/prepare_tpch_imcs.sh" load
+# bash "$source_dir/build_test_imcs.sh" all
+# bash "$source_dir/prepare_tpch_imcs.sh" create
+# bash "$source_dir/prepare_tpch_imcs.sh" load
 bash "$source_dir/prepare_tpch_imcs.sh" populate
 bash "$source_dir/prepare_tpch_imcs.sh" status

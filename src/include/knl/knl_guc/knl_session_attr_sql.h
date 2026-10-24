@@ -68,6 +68,8 @@ typedef struct knl_session_attr_sql {
     bool enable_imcsscan;
     bool enable_imcs_partition_scan;
     bool enable_numa_aware_partition_scan;
+    bool enable_intra_operator_data_access;
+    bool enable_inter_operator_data_access;
     char* imcs_partition_scan_cpus;
     char* imcs_partition_numa_map;
     #endif

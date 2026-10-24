@@ -35,6 +35,9 @@
 #include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
 #include "vecexecutor/vecexecutor.h"
+#ifdef ENABLE_HTAP
+#include "vecexecutor/operator_data_access.h"
+#endif
 #include "vecexecutor/vectorbatch.h"
 #include "vecexecutor/vecnodes.h"
 #include "vecexecutor/vecstream.h"
@@ -144,7 +147,7 @@ static bool NeedStub(const Plan* node)
     );
 }
 #endif   /* ENABLE_MULTIPLE_NODES */
-VectorBatch* VectorEngine(PlanState* node)
+static VectorBatch* VectorEngineRun(PlanState* node)
 {
     VectorBatch* result = NULL;
     MemoryContext old_context = NULL;
@@ -158,11 +161,13 @@ VectorBatch* VectorEngine(PlanState* node)
     /* Response to stop or cancel signal. */
     if (unlikely(executorEarlyStop()))
         return NULL;
+
 #ifdef ENABLE_MULTIPLE_NODES
     if (IS_PGXC_DATANODE && !NeedExecute(node->plan) && NeedStub(node->plan)) {
         return NULL;
     }
 #endif
+
     Assert(node->vectorized);
 
     // Track this node from executor setup through instrumentation teardown.
@@ -180,7 +185,9 @@ VectorBatch* VectorEngine(PlanState* node)
 
     // vec_engine_profile = VecEngineProfileEnabled();
     // if (unlikely(vec_engine_profile)) {
-    //     vec_engine_profile_start = VecEngineProfileEnter(node, &vec_engine_profile_depth, &vec_engine_profile_cpu);
+    //     vec_engine_profile_start =
+    //         VecEngineProfileEnter(node, &vec_engine_profile_depth,
+    //         &vec_engine_profile_cpu);
     // }
 
     t_thrd.pgxc_cxt.GlobalNetInstr = node->instrument;
@@ -188,7 +195,8 @@ VectorBatch* VectorEngine(PlanState* node)
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
 
     // if (unlikely(vec_engine_profile)) {
-    //     VecEngineProfileLeave(node, result, vec_engine_profile_start, vec_engine_profile_depth, vec_engine_profile_cpu);
+    //     VecEngineProfileLeave(node, result, vec_engine_profile_start,
+    //         vec_engine_profile_depth, vec_engine_profile_cpu);
     // }
 
     if (node->instrument) {
@@ -197,31 +205,43 @@ VectorBatch* VectorEngine(PlanState* node)
                 instr_time first_tuple;
                 INSTR_TIME_SET_ZERO(first_tuple);
                 INSTR_TIME_ACCUM_DIFF(
-                    first_tuple, ((VecModifyTableState*)node)->first_tuple_modified, node->instrument->starttime);
+                    first_tuple,
+                    ((VecModifyTableState*)node)->first_tuple_modified,
+                    node->instrument->starttime);
 
                 /*
-                 * If the value of es_last_processed is zero means the value of es_processed
-                 * just come from current operator.	If not means the value of es_processed
-                 * come from current operator and other operator, es_processed minus
-                 * es_last_processed is tuples processed of curent operator	when modify
-                 * the hdfs table, which may include modify the main table and modify the
-                 * detla table, in this case, the value of es_processed will be set twice,
-                 * resulting in error row value for modify operator in explain command.
+                 * If the value of es_last_processed is zero means the value of
+                 * es_processed just come from current operator. If not means
+                 * the value of es_processed come from current operator and
+                 * other operator, es_processed minus es_last_processed is
+                 * tuples processed of current operator when modify the hdfs
+                 * table, which may include modify the main table and modify
+                 * the delta table, in this case, the value of es_processed
+                 * will be set twice, resulting in error row value for modify
+                 * operator in explain command.
                  */
                 if (node->state->es_last_processed == 0) {
                     InstrStopNode(node->instrument, node->state->es_processed);
                 } else {
-                    InstrStopNode(node->instrument, node->state->es_processed - node->state->es_last_processed);
+                    InstrStopNode(
+                        node->instrument,
+                        node->state->es_processed -
+                        node->state->es_last_processed);
                 }
 
                 node->state->es_last_processed = node->state->es_processed;
                 node->instrument->firsttuple = INSTR_TIME_GET_DOUBLE(first_tuple);
                 break;
+
             default:
-                InstrStopNode(node->instrument, BatchIsNull(result) ? 0.0 : result->m_rows);
+                InstrStopNode(
+                    node->instrument,
+                    BatchIsNull(result) ? 0.0 : result->m_rows);
                 break;
         }
-        node->instrument->memoryinfo.operatorMemory = node->plan->operatorMemKB[0];
+
+        node->instrument->memoryinfo.operatorMemory =
+            node->plan->operatorMemKB[0];
 
         if (BatchIsNull(result))
             node->instrument->status = true;
@@ -234,6 +254,125 @@ VectorBatch* VectorEngine(PlanState* node)
     VecCacheTraceLeave(node);
     return result;
 }
+
+VectorBatch* VectorEngine(PlanState* node)
+{
+#ifdef ENABLE_HTAP
+    if (unlikely(u_sess->attr.attr_sql.enable_inter_operator_data_access ||
+        u_sess->attr.attr_sql.enable_intra_operator_data_access)) {
+        OperatorDataAccessFrame frame;
+        OperatorDataAccessEnter(&frame, node);
+
+        VectorBatch* result = NULL;
+
+        PG_TRY();
+        {
+            result = VectorEngineRun(node);
+            OperatorDataAccessLeave(&frame, result);
+        }
+        PG_CATCH();
+        {
+            OperatorDataAccessRestore(&frame, true);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        return result;
+    }
+#endif
+
+    return VectorEngineRun(node);
+}
+// VectorBatch* VectorEngine(PlanState* node)
+// {
+//     VectorBatch* result = NULL;
+//     MemoryContext old_context = NULL;
+//     // bool vec_engine_profile = false;
+//     // uint64 vec_engine_profile_start = 0;
+//     // int vec_engine_profile_depth = 0;
+//     // int vec_engine_profile_cpu = -1;
+
+//     CHECK_FOR_INTERRUPTS();
+
+//     /* Response to stop or cancel signal. */
+//     if (unlikely(executorEarlyStop()))
+//         return NULL;
+// #ifdef ENABLE_MULTIPLE_NODES
+//     if (IS_PGXC_DATANODE && !NeedExecute(node->plan) && NeedStub(node->plan)) {
+//         return NULL;
+//     }
+// #endif
+//     Assert(node->vectorized);
+
+//     // Track this node from executor setup through instrumentation teardown.
+//     VecCacheTraceEnter(node);
+
+//     if (node->nodeContext) {
+//         old_context = MemoryContextSwitchTo(node->nodeContext);
+//     }
+
+//     if (node->chgParam != NULL) /* something changed */
+//         VecExecReScan(node);    /* let ReScan handle this */
+
+//     if (node->instrument)
+//         InstrStartNode(node->instrument);
+
+//     // vec_engine_profile = VecEngineProfileEnabled();
+//     // if (unlikely(vec_engine_profile)) {
+//     //     vec_engine_profile_start = VecEngineProfileEnter(node, &vec_engine_profile_depth, &vec_engine_profile_cpu);
+//     // }
+
+//     t_thrd.pgxc_cxt.GlobalNetInstr = node->instrument;
+//     result = VectorEngineRunner[GetRunnerIdx(nodeTag(node))](node);
+//     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
+
+//     // if (unlikely(vec_engine_profile)) {
+//     //     VecEngineProfileLeave(node, result, vec_engine_profile_start, vec_engine_profile_depth, vec_engine_profile_cpu);
+//     // }
+
+//     if (node->instrument) {
+//         switch (nodeTag(node)) {
+//             case T_VecModifyTableState:
+//                 instr_time first_tuple;
+//                 INSTR_TIME_SET_ZERO(first_tuple);
+//                 INSTR_TIME_ACCUM_DIFF(
+//                     first_tuple, ((VecModifyTableState*)node)->first_tuple_modified, node->instrument->starttime);
+
+//                 /*
+//                  * If the value of es_last_processed is zero means the value of es_processed
+//                  * just come from current operator.	If not means the value of es_processed
+//                  * come from current operator and other operator, es_processed minus
+//                  * es_last_processed is tuples processed of curent operator	when modify
+//                  * the hdfs table, which may include modify the main table and modify the
+//                  * detla table, in this case, the value of es_processed will be set twice,
+//                  * resulting in error row value for modify operator in explain command.
+//                  */
+//                 if (node->state->es_last_processed == 0) {
+//                     InstrStopNode(node->instrument, node->state->es_processed);
+//                 } else {
+//                     InstrStopNode(node->instrument, node->state->es_processed - node->state->es_last_processed);
+//                 }
+
+//                 node->state->es_last_processed = node->state->es_processed;
+//                 node->instrument->firsttuple = INSTR_TIME_GET_DOUBLE(first_tuple);
+//                 break;
+//             default:
+//                 InstrStopNode(node->instrument, BatchIsNull(result) ? 0.0 : result->m_rows);
+//                 break;
+//         }
+//         node->instrument->memoryinfo.operatorMemory = node->plan->operatorMemKB[0];
+
+//         if (BatchIsNull(result))
+//             node->instrument->status = true;
+//     }
+
+//     if (old_context) {
+//         (void)MemoryContextSwitchTo(old_context);
+//     }
+
+//     VecCacheTraceLeave(node);
+//     return result;
+// }
 
 /*
  * ExecVecMarkPos
@@ -370,6 +509,12 @@ void ExecEarlyFree(PlanState* node)
 
         return;
     }
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active)) {
+        OperatorDataAccessFlushPending();
+        OperatorDataAccessForgetInputs();
+    }
+#endif
     ExecEarlyFreeBody(node);
 }
 

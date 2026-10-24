@@ -14,6 +14,7 @@
  */
 
 #include "postgres.h"
+#include "vecexecutor/operator_data_access.h"
 #include "knl/knl_variable.h"
 
 #include <limits.h>
@@ -475,7 +476,12 @@ void batchsort_end(Batchsortstate* state)
      * Free the per-sort memory context, thereby releasing all working memory,
      * including the Batchsortstate struct itself.
      */
-    MemoryContextDelete(state->sortcontext);
+    // MemoryContextDelete(state->sortcontext);
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessForgetInputs();
+#endif
++    MemoryContextDelete(OperatorDataAccessReleaseContext(state->sortcontext));
 }
 
 /*
@@ -783,13 +789,24 @@ bool Batchsortstate::ConsiderAbortCommon()
     return false;
 }
 
+#ifdef ENABLE_HTAP
+static int DataAccessSortCompare(const void* a, const void* b, void* state)
+{
+    return ((Batchsortstate*)state)->CompareMultiColumnWithDataAccess((const MultiColumns*)a, (const MultiColumns*)b);
+}
+#endif
+
 void Batchsortstate::SortInMem()
 {
     if (m_storeColumns.m_memRowNum > 1) {
         qsort_arg(m_storeColumns.m_memValues,
             m_storeColumns.m_memRowNum,
             sizeof(MultiColumns),
-            (qsort_arg_comparator)compareMultiColumn,
+#ifdef ENABLE_HTAP
+            unlikely(operator_data_access_active) ? DataAccessSortCompare : (qsort_arg_comparator)compareMultiColumn,
+#else
+             (qsort_arg_comparator)compareMultiColumn,
+#endif
             (void*)this);
     }
 }
@@ -1630,7 +1647,8 @@ void Batchsortstate::MakeBoundedHeap()
     m_storeColumns.m_memRowNum = 0; /* make the heap empty */
     for (i = 0; i < tupcount; i++) {
         if (m_storeColumns.m_memRowNum >= m_bound &&
-            compareMultiColumn(m_storeColumns.m_memValues + i, m_storeColumns.m_memValues, this) <= 0) {
+            // compareMultiColumn(m_storeColumns.m_memValues + i, m_storeColumns.m_memValues, this) <= 0) {
+            CompareMultiColumnWithDataAccess(m_storeColumns.m_memValues + i, m_storeColumns.m_memValues) <= 0) {
             /* New tuple would just get thrown out, so skip it */
             FreeMultiColumn(m_storeColumns.m_memValues + i);
         } else {
@@ -1737,13 +1755,37 @@ void Batchsortstate::SelectNewTape()
 template <bool checkIdx>
 int Batchsortstate::THeapCompare(MultiColumns* a, MultiColumns* b)
 {
-    return (checkIdx && (a->idx != b->idx) ? (a->idx - b->idx) : compareMultiColumn(a, b, this));
+    // return (checkIdx && (a->idx != b->idx) ? (a->idx - b->idx) : compareMultiColumn(a, b, this));
+    return (checkIdx && (a->idx != b->idx) ? (a->idx - b->idx) : CompareMultiColumnWithDataAccess(a, b));
 }
 
 int Batchsortstate::HeapCompare(MultiColumns* a, MultiColumns* b, bool checkIdx)
 {
-    return (checkIdx && (a->idx != b->idx) ? (a->idx - b->idx) : compareMultiColumn(a, b, this));
+    return (checkIdx && (a->idx != b->idx) ? (a->idx - b->idx) : CompareMultiColumnWithDataAccess(a, b));
 }
+
+#ifdef ENABLE_HTAP
+void Batchsortstate::ObserveJitComparison(const MultiColumns* a, const MultiColumns* b)
+{
+    OperatorDataAccessScope* dataAccess = OperatorDataAccessState(true);
+    if (dataAccess == NULL)
+        return;
+    /* Native code may stop at an earlier key; these are candidate input ranges. */
+    for (int key = 0; key < m_nKeys; ++key) {
+        int col = m_scanKeys[key].sk_attno - 1;
+        dataAccess->Observe(a->m_values + col, sizeof(Datum), DA_STATE, DA_READ);
+        dataAccess->Observe(b->m_values + col, sizeof(Datum), DA_STATE, DA_READ);
+        dataAccess->Observe(a->m_nulls + col, sizeof(uint8), DA_STATE, DA_READ);
+        dataAccess->Observe(b->m_nulls + col, sizeof(uint8), DA_STATE, DA_READ);
+        if (NeedDecode(col)) {
+            if (NOT_NULL(a->m_nulls[col]))
+                dataAccess->Observe(DatumGetPointer(a->m_values[col]), VARSIZE_ANY(a->m_values[col]), DA_STATE, DA_READ);
+            if (NOT_NULL(b->m_nulls[col]))
+                dataAccess->Observe(DatumGetPointer(b->m_values[col]), VARSIZE_ANY(b->m_values[col]), DA_STATE, DA_READ);
+        }
+    }
+}
+#endif
 
 /*
  * Inline-able copy of FunctionCall2Coll() to save some cycles in sorting.
@@ -1820,6 +1862,9 @@ static inline int32 inlineApplySortFunction(
 template <bool abbreSortOptimize>
 int CompareMultiColumn(const MultiColumns* a, const MultiColumns* b, Batchsortstate* state)
 {
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
     ScanKey scanKey = state->m_scanKeys;
     int nkey;
     int32 compare = 0;
@@ -1838,6 +1883,14 @@ int CompareMultiColumn(const MultiColumns* a, const MultiColumns* b, Batchsortst
         /* Compare the leading sort key */
         if (state->sortKeys->abbrev_converter) {
             colIdx = scanKey->sk_attno - 1;
+#ifdef ENABLE_HTAP
+            if (dataAccess != NULL) {
+                dataAccess->Observe(a->m_values + state->m_colNum, sizeof(Datum), DA_STATE, DA_READ);
+                dataAccess->Observe(b->m_values + state->m_colNum, sizeof(Datum), DA_STATE, DA_READ);
+                dataAccess->Observe(a->m_nulls + colIdx, sizeof(uint8), DA_STATE, DA_READ);
+                dataAccess->Observe(b->m_nulls + colIdx, sizeof(uint8), DA_STATE, DA_READ);
+            }
+#endif
             compare = ApplySortComparator(a->m_values[state->m_colNum],
                 IS_NULL(a->m_nulls[colIdx]),
                 b->m_values[state->m_colNum],
@@ -1860,7 +1913,21 @@ int CompareMultiColumn(const MultiColumns* a, const MultiColumns* b, Batchsortst
         datum2Tmp = datum2 = b->m_values[colIdx];
         isnull1 = IS_NULL(a->m_nulls[colIdx]);
         isnull2 = IS_NULL(b->m_nulls[colIdx]);
+#ifdef ENABLE_HTAP
+        if (dataAccess != NULL) {
+            dataAccess->Observe(a->m_values + colIdx, sizeof(Datum), DA_STATE, DA_READ);
+            dataAccess->Observe(b->m_values + colIdx, sizeof(Datum), DA_STATE, DA_READ);
+            dataAccess->Observe(a->m_nulls + colIdx, sizeof(uint8), DA_STATE, DA_READ);
+            dataAccess->Observe(b->m_nulls + colIdx, sizeof(uint8), DA_STATE, DA_READ);
+            if (state->NeedDecode(colIdx)) {
+                if (!isnull1)
+                    dataAccess->Observe(DatumGetPointer(datum1Tmp), VARSIZE_ANY(datum1Tmp), DA_STATE, DA_READ);
+                if (!isnull2)
+                    dataAccess->Observe(DatumGetPointer(datum2Tmp), VARSIZE_ANY(datum2Tmp), DA_STATE, DA_READ);
+            }
+        }
 
+#endif
         switch (typeOid) {
             // extract header
             case TIMETZOID:

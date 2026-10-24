@@ -21,6 +21,7 @@
  * ---------------------------------------------------------------------------------------
  */
 #include "vecexecutor/vectorbatch.h"
+#include "vecexecutor/operator_data_access.h"
 #include "vecexecutor/vecstore.h"
 
 void MultiColumnsData::Init(int capacity)
@@ -41,6 +42,10 @@ void VecStore::InitColInfo(VectorBatch* batch)
 
 void VecStore::FreeMultiColumn(MultiColumns* pMultiColumn)
 {
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessFlushPending();
+#endif
     FreeMem(GetMemoryChunkSpace(pMultiColumn->m_values));
     FreeMem(GetMemoryChunkSpace(pMultiColumn->m_nulls));
 
@@ -136,6 +141,13 @@ void VecStore::SetData(char* dataPtr, int dataSize, MultiColumns* multiColumn)
 }
 void VecStore::AppendBatch(VectorBatch* batch, MultiColumns& multiColumn, int curRow, bool isfree)
 {
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess = unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+    if (dataAccess != NULL) {
+        dataAccess->Observe(multiColumn.m_values, batch->m_cols * sizeof(Datum), DA_STATE, DA_READ);
+        dataAccess->Observe(multiColumn.m_nulls, batch->m_cols * sizeof(uint8), DA_STATE, DA_READ);
+    }
+#endif
     Datum* pValues = multiColumn.m_values;
     uint8* flag_arr = multiColumn.m_nulls;
     uint8 flag;
@@ -148,12 +160,20 @@ void VecStore::AppendBatch(VectorBatch* batch, MultiColumns& multiColumn, int cu
         if (!IS_NULL(flag)) {
             if (NeedDecode(i)) {
                 Assert(vec->m_desc.encoded);
+#ifdef ENABLE_HTAP
+                if (dataAccess != NULL)
+                    dataAccess->Observe(DatumGetPointer(pValues[i]), VARSIZE_ANY(pValues[i]), DA_STATE, DA_READ);
+#endif
                 vec->m_vals[curRow] = vec->AddVarWithHeader(pValues[i]);
             } else {
                 vec->m_vals[curRow] = pValues[i];
             }
         }
         vec->m_rows++;
+#ifdef ENABLE_HTAP
+        if (dataAccess != NULL)
+            dataAccess->ObserveVector(vec, curRow, curRow + 1, DA_BATCH, DA_WRITE, true);
+#endif
     }
     batch->m_rows++;
     if (isfree)

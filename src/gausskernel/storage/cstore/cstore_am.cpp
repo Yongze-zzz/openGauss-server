@@ -72,6 +72,7 @@
 #include "access/htap/imcucache_mgr.h"
 #include "access/htap/ss_imcucache_mgr.h"
 #include "access/htap/imcstore_am.h"
+#include "vecexecutor/operator_data_access.h"
 #endif
 
 #ifdef PGXC
@@ -2350,8 +2351,18 @@ int CStore::FillVector(_in_ int seq, _in_ CUDesc* cuDescPtr, _out_ ScalarVector*
 #endif
 
     // step 5: CUToVector
+#ifdef ENABLE_HTAP
+    int accessBegin = m_scanPosInCU[seq];
+#endif
     pos = cuPtr->ToVector<attlen, hasDeadRow>(
               vec, leftRows, this->m_rowCursorInCU, this->m_scanPosInCU[seq], deadRows, this->m_cuDelMask);
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active)) {
+        vec->m_rows = pos;
+        OperatorDataAccessCU(cuPtr, vec, accessBegin, m_scanPosInCU[seq],
+            m_rowCursorInCU, pos, deadRows, attlen, hasDeadRow);
+    }
+#endif
 
     if (IsValidCacheSlotID(slotId)) {
         // CU is pinned
@@ -2553,6 +2564,12 @@ void CStore::FillVectorLateRead(
     } else {
         pos = cuPtr->ToVectorLateRead<attlen, false>(tids, vec);
     }
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active)) {
+        vec->m_rows = pos;
+        OperatorDataAccessCULate(cuPtr, tids, vec, pos, attlen);
+    }
+#endif
 
     if (IsValidCacheSlotID(slotId)) {
         // CU is pinned

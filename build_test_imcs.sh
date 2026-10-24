@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./build_test_imcs.sh build|init|start|all
+# Usage: ./build_test_imcs.sh build|init|configure|start|all
 # all: build, install, initialize the data directory, and start the database.
 
 source_dir=${SOURCE_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
@@ -11,13 +11,10 @@ pgdata=${PGDATA:-/mnt/nvme1p1/gauss}
 port=${PORT:-${PGPORT:-19999}}
 db_name=${DB_NAME:-tpch}
 jobs=${JOBS:-8}
-imcs_cache=${IMCS_CACHE:-256GB}
-max_memory=${MAX_PROCESS_MEMORY:-600GB}
-shared_buffers=${SHARED_BUFFERS:-50GB}
-work_mem=${WORK_MEM:-50GB}
-max_connections=${MAX_CONNECTIONS:-4096}
-thread_pool_attr=${THREAD_POOL_ATTR:-"192,1,(nobind)"}
-thread_pool_stream_attr=${THREAD_POOL_STREAM_ATTR:-"192,0.2,1,(nobind)"}
+reference_conf=${REFERENCE_CONF:-$source_dir/config/imcs_reference.conf}
+dop=${DOP:-192}
+numactl_args=${NUMACTL_ARGS-"--physcpubind=0-191 --membind=0-7"}
+read -r -a numa_args <<< "$numactl_args"
 ctl="$install_dir/bin/gs_ctl"
 sql=("${GSQL_BIN:-$install_dir/bin/gsql}" -X -v ON_ERROR_STOP=1 -P pager=off -p "$port")
 
@@ -68,24 +65,51 @@ init() {
         -E UTF8 --locale=C -W
 }
 
+configure() {
+    local node_name backup stream_attr
+    [[ $dop =~ ^[1-9][0-9]*$ && $dop -gt 1 ]] ||
+        { echo 'DOP must be an integer greater than 1.' >&2; return 1; }
+    [[ -r $reference_conf && -f $pgdata/postgresql.conf ]] ||
+        { echo 'REFERENCE_CONF and PGDATA/postgresql.conf must exist.' >&2; return 1; }
+
+    # Preserve the identity of the initialized target instance.
+    node_name=$(awk '/^[[:space:]]*pgxc_node_name[[:space:]]*=/ {
+        value = substr($0, index($0, "=") + 1)
+        sub(/[[:space:]]*#.*/, "", value)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+    } END { print value }' "$pgdata/postgresql.conf")
+    [[ -n $node_name ]] || { echo 'Target pgxc_node_name is missing.' >&2; return 1; }
+    stream_attr=${THREAD_POOL_STREAM_ATTR:-"$((dop * 5)),0.2"}
+    backup=$(mktemp "$pgdata/postgresql.conf.before_imcs.XXXXXX") || return
+    cp -p "$pgdata/postgresql.conf" "$backup" || return
+    echo "Configuration backup: $backup"
+    if ! cp "$reference_conf" "$pgdata/postgresql.conf"; then
+        cp -p "$backup" "$pgdata/postgresql.conf"
+        return 1
+    fi
+    if ! "$install_dir/bin/gs_guc" set -D "$pgdata" \
+        -c "port=$port" -c "pgxc_node_name=$node_name" \
+        -c "thread_pool_stream_attr='$stream_attr'"; then
+        cp -p "$backup" "$pgdata/postgresql.conf"
+        return 1
+    fi
+    echo "Reference: $reference_conf; DOP: $dop; Stream: $stream_attr"
+}
+
 start() {
     local exists
+    local launcher=()
+    if [[ ${#numa_args[@]} -gt 0 ]]; then
+        command -v numactl >/dev/null || return
+        numactl "${numa_args[@]}" true || return
+        launcher=(numactl "${numa_args[@]}")
+    fi
+    configure || return
     stop || return
 
-    # Write the common benchmark settings to PGDATA/postgresql.conf before startup.
-    # One unbound group leaves CPU placement to the NUMA-aware scan experiment.
-    # Scan switches, DOP, CPU lists and populate settings stay in their SQL sessions.
-    "$install_dir/bin/gs_guc" set -D "$pgdata" \
-        -c "port=$port" -c "max_imcs_cache=$imcs_cache" \
-        -c "max_process_memory=$max_memory" \
-        -c "shared_buffers=$shared_buffers" -c "work_mem=$work_mem" \
-        -c "max_connections=$max_connections" -c "enable_thread_pool=on" \
-        -c "thread_pool_attr='$thread_pool_attr'" \
-        -c "thread_pool_stream_attr='$thread_pool_stream_attr'" \
-        -c "use_workload_manager=off" || return
-
+    # Apply the CPU/memory policy to gaussdb through its gs_ctl parent.
     # Use this installation, without reusing an old postmaster.opts command.
-    "$ctl" start -D "$pgdata" -Z single_node -p "$install_dir/bin/gaussdb" \
+    "${launcher[@]}" "$ctl" start -D "$pgdata" -Z single_node -p "$install_dir/bin/gaussdb" \
         -l "$pgdata/server.log" -w -t 120 || return
 
     # prepare_tpch_imcs.sh creates tables, so create its database here if needed.
@@ -105,17 +129,20 @@ SQL
 case "${1:---help}" in
     build) build ;;
     init) init ;;
+    configure) configure ;;
     start) start ;;
     all) build && init && start ;;
     -h|--help)
-        echo "Usage: $0 build|init|start|all"
+        echo "Usage: $0 build|init|configure|start|all"
         echo 'build: compile and install; init: gs_initdb; start: start/restart and create DB_NAME.'
+        echo 'configure: back up and replace postgresql.conf from REFERENCE_CONF, without restarting.'
         echo 'all: build -> init -> start. Initialization prompts for an administrator password.'
-        echo 'Defaults: PGDATA=/mnt/nvme1p1/gauss PORT=19999 DB_NAME=tpch IMCS_CACHE=256GB JOBS=8'
-        echo 'MAX_PROCESS_MEMORY defaults to 600GB, matching the existing test instance.'
-        echo 'Memory defaults: SHARED_BUFFERS=50GB WORK_MEM=1GB; MAX_CONNECTIONS=4096.'
-        echo 'Thread defaults: THREAD_POOL_ATTR="192,1,(nobind)" THREAD_POOL_STREAM_ATTR="192,0.2,1,(nobind)".'
-        echo 'start writes these settings to PGDATA/postgresql.conf and disables workload management.'
+        echo 'Defaults: PGDATA=/mnt/nvme1p1/gauss PORT=19999 DB_NAME=tpch JOBS=8 DOP=192'
+        echo 'REFERENCE_CONF defaults to config/imcs_reference.conf (the data instance baseline).'
+        echo 'All baseline settings are retained except PORT, the target node name, and Stream sizing.'
+        echo 'THREAD_POOL_STREAM_ATTR defaults to "DOP * 5,0.2"; query DOP is set by run_imcs_queries.sh.'
+        echo 'NUMACTL_ARGS defaults to "--physcpubind=0-191 --membind=0-7"; set it to empty to disable.'
+        echo 'Changing DOP/NUMACTL_ARGS for an experiment requires start and then IMCS populate again.'
         echo 'Paths: SOURCE_DIR, BUILD_DIR, INSTALL_DIR, BINARYLIBS, GCC_PATH.'
         echo 'prepare_tpch_imcs.sh still uses the parent shell PATH or GSQL_BIN.'
         ;;

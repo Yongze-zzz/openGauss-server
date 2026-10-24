@@ -29,7 +29,8 @@ ifneq "$(MAKECMDGOALS)" "clean"
     endif
   endif
 endif
-OBJS = vectorbatch.o vecexecutor.o vecexpression.o vecvar.o vecfuncache.o vec_cache_trace.o vec_engine_profile.o
+# OBJS = vectorbatch.o vecexecutor.o vecexpression.o vecvar.o vecfuncache.o vec_cache_trace.o vec_engine_profile.o
+OBJS = vectorbatch.o vecexecutor.o vecexpression.o vecvar.o vecfuncache.o vec_cache_trace.o vec_engine_profile.o operator_data_access.o
 
 SUBDIRS     = vecnode vectorsonic
 

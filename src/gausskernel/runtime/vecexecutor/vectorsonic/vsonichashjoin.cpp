@@ -24,6 +24,7 @@
  * -----------------------------------------------------------------------------
  */
 #include "vectorsonic/vsonichash.h"
+#include "vecexecutor/operator_data_access.h"
 #include "vectorsonic/vsonichashjoin.h"
 #include "utils/memprot.h"
 
@@ -595,6 +596,9 @@ void SonicHashJoin::saveToMemory(VectorBatch* batch)
         memPartition->putHash(m_hashVal, rows);
     }
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessReadBatch(batch);
+#endif
     memPartition->putBatch(batch);
 
     /*
@@ -1056,6 +1060,11 @@ void SonicHashJoin::buildHashTable(uint32 curPartIdx)
     BucketType* hashBucket = ((BucketType*)mem_partition->m_bucket);
     BucketType* hashNext = ((BucketType*)mem_partition->m_next);
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
 #ifdef USE_PRIME
     mem_partition->m_mask = mem_partition->m_hashSize;
 #else
@@ -1099,11 +1108,24 @@ void SonicHashJoin::buildHashTable(uint32 curPartIdx)
             loc_id = GETLOCID(*hash_val, mask);
 
             if (!isSegHashTable) {
+#ifdef ENABLE_HTAP
+                if (dataAccess != NULL) {
+                    dataAccess->Observe(&hashBucket[loc_id], sizeof(BucketType), DA_STATE, DA_READ);
+                    dataAccess->Observe(&hashNext[tup_idx], sizeof(BucketType), DA_STATE, DA_WRITE);
+                    dataAccess->Observe(&hashBucket[loc_id], sizeof(BucketType), DA_STATE, DA_WRITE);
+                }
+#endif
                 hashNext[tup_idx] = hashBucket[loc_id];
                 hashBucket[loc_id] = tup_idx;
             } else {
                 /* For now, only use uint32 */
                 uint32 segBucketPos = (uint32)mem_partition->m_segBucket->getNthDatum(loc_id);
+#ifdef ENABLE_HTAP
+                if (dataAccess != NULL) {
+                    dataAccess->ObserveSonic(mem_partition->m_segNext, tup_idx, DA_WRITE);
+                    dataAccess->ObserveSonic(mem_partition->m_segBucket, loc_id, DA_WRITE);
+                }
+#endif
                 mem_partition->m_segNext->setNthDatum(tup_idx, (ScalarValue*)&segBucketPos);
                 mem_partition->m_segBucket->setNthDatum(loc_id, (ScalarValue*)&tup_idx);
             }
@@ -1151,6 +1173,11 @@ inline VectorBatch* SonicHashJoin::probeMemoryTable(SonicHashSource* probeP)
     SonicHashMemPartition* mem_partition = (SonicHashMemPartition*)m_innerPartitions[m_probeIdx];
     BucketType* hashBucket = (BucketType*)mem_partition->m_bucket;
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
     Assert(mem_partition->m_status == partitionStatusMemory);
 
     mask = mem_partition->m_mask;
@@ -1188,6 +1215,11 @@ inline VectorBatch* SonicHashJoin::probeMemoryTable(SonicHashSource* probeP)
                     if (isSegHashTable) {
                         loc_id = (BucketType)mem_partition->m_segBucket->getNthDatum(GETLOCID(*loc3, mask));
                     } else {
+#ifdef ENABLE_HTAP
+                        if (dataAccess != NULL)
+                            dataAccess->Observe(&hashBucket[GETLOCID(*loc3, mask)],
+                                sizeof(BucketType), DA_STATE, DA_READ);
+#endif
                         loc_id = hashBucket[GETLOCID(*loc3, mask)];
                     }
 
@@ -1487,6 +1519,11 @@ inline VectorBatch* SonicHashJoin::innerJoin(VectorBatch* batch)
 
     BucketType* hashNext = (BucketType*)mem_partition->m_next;
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
     while (m_selectRows) {
         /* match inner and outer keys. */
         if (complicateJoinKey) {
@@ -1530,6 +1567,10 @@ inline VectorBatch* SonicHashJoin::innerJoin(VectorBatch* batch)
             if (isSegHashTable) {
                 loc_id = (BucketType)mem_partition->m_segNext->getNthDatum(*loc2++);
             } else {
+#ifdef ENABLE_HTAP
+                if (dataAccess != NULL)
+                    dataAccess->Observe(&hashNext[*loc2], sizeof(BucketType), DA_STATE, DA_READ);
+#endif
                 loc_id = hashNext[*loc2++];
             }
 
@@ -1658,6 +1699,11 @@ inline VectorBatch* SonicHashJoin::probePartition(SonicHashSource* probeP)
     BucketType* hash_bucket = NULL;
     SonicDatumArray* seg_bucket = NULL;
 
+#ifdef ENABLE_HTAP
+    OperatorDataAccessScope* dataAccess =
+        unlikely(operator_data_access_active) ? OperatorDataAccessState() : NULL;
+#endif
+
     if (m_partLoadedOffset >= 0) {
         mask = mem_partition->m_mask;
         seg_bucket = mem_partition->m_segBucket;
@@ -1725,6 +1771,11 @@ inline VectorBatch* SonicHashJoin::probePartition(SonicHashSource* probeP)
                     if (isSegHashTable) {
                         loc_id = (BucketType)seg_bucket->getNthDatum(GETLOCID(*loc3, mask));
                     } else {
+#ifdef ENABLE_HTAP
+                        if (dataAccess != NULL)
+                            dataAccess->Observe(&hash_bucket[GETLOCID(*loc3, mask)],
+                                sizeof(BucketType), DA_STATE, DA_READ);
+#endif
                         loc_id = hash_bucket[GETLOCID(*loc3, mask)];
                     }
 
@@ -1959,14 +2010,14 @@ void SonicHashJoin::freeMemoryContext()
 {
     if (m_memControl.hashContext != NULL) {
         /* Delete child context for hashContext */
-        MemoryContextDelete(m_memControl.hashContext);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_memControl.hashContext));
         m_memControl.hashContext = NULL;
         m_innerPartitions = NULL;
         m_outerPartitions = NULL;
     }
     if (m_memControl.tmpContext != NULL) {
         /* Delete child context for tmpContext */
-        MemoryContextDelete(m_memControl.tmpContext);
+        MemoryContextDelete(OperatorDataAccessReleaseContext(m_memControl.tmpContext));
         m_memControl.tmpContext = NULL;
     }
 }
@@ -2991,7 +3042,7 @@ void SonicHashJoin::ResetNecessary()
         closeAllFiles();
 
     /* Reset hashContext */
-    MemoryContextResetAndDeleteChildren(m_memControl.hashContext);
+    MemoryContextResetAndDeleteChildren(OperatorDataAccessReleaseContext(m_memControl.hashContext));
 
     {
         /* Recreate m_innerPartitions */

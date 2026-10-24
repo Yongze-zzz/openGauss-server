@@ -24,6 +24,7 @@
  */
 
 #include "postgres.h"
+#include "vecexecutor/operator_data_access.h"
 #include "knl/knl_variable.h"
 
 #include <limits.h>
@@ -365,6 +366,9 @@ void BatchStore::GetBatch(bool forward, VectorBatch* batch, int batch_rows)
 
 void BatchStore::PutBatch(VectorBatch* batch)
 {
+#ifdef ENABLE_HTAP
+    OperatorDataAccessReadBatch(batch);
+#endif
     for (int i = 0; i < m_readptrcount; i++) {
         if (i != m_activeptr)
             m_readptrs[i].eof_reached = false;
@@ -531,7 +535,12 @@ void batchstore_end(BatchStore* state)
     // Free the per-batchstore memory context, thereby releasing all working memory,
     // including the BatchStore struct itself.
     //
-    MemoryContextDelete(state->m_storecontext);
+    // MemoryContextDelete(state->m_storecontext);
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessForgetInputs();
+#endif
+    MemoryContextDelete(OperatorDataAccessReleaseContext(state->m_storecontext));
 }
 
 /*

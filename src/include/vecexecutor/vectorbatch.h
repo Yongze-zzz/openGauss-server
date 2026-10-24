@@ -33,6 +33,12 @@
 // Scalar data type
 //
 typedef uintptr_t ScalarValue;
+#ifdef ENABLE_HTAP
+class VectorBatch;
+extern THR_LOCAL bool operator_data_access_active;
+extern void OperatorDataAccessBatchCopy(VectorBatch* source, VectorBatch* target, int sourceBegin,
+    int targetBegin, int rows, bool singleRow, bool deep);
+#endif
 
 #define V_NULL_MASK 0b00000001
 #define V_NOTNULL_MASK 0b00000000
@@ -441,9 +447,9 @@ public:
     int GetSysColumnNum();
 
     template <bool deep, bool add>
-    void Copy(VectorBatch* batch, int start_idx = 0, int endIdx = -1);
+    void Copy(VectorBatch* batch, int start_idx = 0, int endIdx = -1, bool trackDataAccess = true);
 
-    void CopyNth(VectorBatch* batchSrc, int Nth);
+    void CopyNth(VectorBatch* batchSrc, int Nth, bool trackDataAccess = true);
 
 public:
     /* Pack template function. */
@@ -476,8 +482,11 @@ private:
  * @template add - add rows or not
  */
 template <bool deep, bool add>
-void VectorBatch::Copy(VectorBatch* batch, int start_idx, int endIdx)
+void VectorBatch::Copy(VectorBatch* batch, int start_idx, int endIdx, bool trackDataAccess)
 {
+#ifdef ENABLE_HTAP
+    int targetBegin = add ? m_rows : 0;
+#endif
     int copy_end_idx;
     copy_end_idx = (endIdx == -1) ? batch->m_rows : endIdx;
     for (int i = 0; i < m_cols; i++) {
@@ -493,6 +502,10 @@ void VectorBatch::Copy(VectorBatch* batch, int start_idx, int endIdx)
     if (false == add)
         m_rows = 0;
     m_rows += copy_end_idx - start_idx;
+#ifdef ENABLE_HTAP
+    if (trackDataAccess && unlikely(operator_data_access_active))
+        OperatorDataAccessBatchCopy(batch, this, start_idx, targetBegin, copy_end_idx - start_idx, false, deep);
+#endif
 }
 
 template <Oid datumType>
