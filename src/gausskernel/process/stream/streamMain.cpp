@@ -115,13 +115,6 @@ int StreamMain()
 
     oldTryCounter = gstrace_tryblock_entry(&curTryCounter);
     
-    MemoryContext oldMemory = MemoryContextSwitchTo(
-        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
-#ifdef ENABLE_LLVM_COMPILE
-    CodeGenThreadInitialize();
-#endif
-    (void)MemoryContextSwitchTo(oldMemory);
-    
     /* We can now handle ereport(ERROR) */
     t_thrd.log_cxt.PG_exception_stack = &local_sigjmp_buf;
 
@@ -137,6 +130,16 @@ int StreamMain()
             Assert(CheckMyDatabaseMatch());
             pgstat_report_waitstatus(STATE_WAIT_UNDEFINED);
         }
+
+#ifdef ENABLE_LLVM_COMPILE
+        /* ExecutorEnd releases the previous task's codegen object. Reinitialize
+         * after WaitMission has restored the new task's session and GUCs, so
+         * reused Stream threads can generate code for every query. */
+        {
+            AutoContextSwitch memSwitch(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
+            CodeGenThreadInitialize();
+        }
+#endif
 
         pgstat_report_queryid(u_sess->debug_query_id);
         pgstat_report_unique_sql_id(false);

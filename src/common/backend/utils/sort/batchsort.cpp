@@ -481,7 +481,7 @@ void batchsort_end(Batchsortstate* state)
     if (unlikely(operator_data_access_active))
         OperatorDataAccessForgetInputs();
 #endif
-+    MemoryContextDelete(OperatorDataAccessReleaseContext(state->sortcontext));
+    MemoryContextDelete(OperatorDataAccessReleaseContext(state->sortcontext));
 }
 
 /*

@@ -1318,8 +1318,9 @@ bool CStoreInsert::TryEncodeNumeric(int col, bulkload_rows* batchRowPtr, CUDesc*
     int exact_size = 0;
     int rc = 0;
 
-    if (COMPRESS_NO == heaprel_get_compression_from_modes(m_compress_modes)) {
-        // nothing to do if compression level is NO.
+    // IMCS still needs numeric encoding: decompression restores BI64 values
+    // for vector execution even when general CU compression is disabled.
+    if (!m_isImcstore && COMPRESS_NO == heaprel_get_compression_from_modes(m_compress_modes)) {
         return false;
     }
 

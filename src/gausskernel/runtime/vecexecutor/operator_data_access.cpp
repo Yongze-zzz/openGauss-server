@@ -634,11 +634,16 @@ void OperatorDataAccessCU(CU* cu, ScalarVector* output, int begin, int end,
     scope.ObserveVector(output, 0, rows, DA_BATCH, DA_WRITE, true);
 }
 
-void OperatorDataAccessCULate(CU* cu, ScalarVector* tids, ScalarVector* output, int rows, int attlen)
+/* Must run before ToVectorLateRead: its output may overwrite the TID vector. */
+void OperatorDataAccessCULate(CU* cu, ScalarVector* tids, int attlen)
 {
     if (currentFrame == NULL || !u_sess->attr.attr_sql.enable_intra_operator_data_access)
         return;
+    int rows = tids->m_rows;
     OperatorDataAccessScope scope(currentFrame->node, DA_SCAN_ACCESS, rows);
+    /* TIDs occupy ScalarValue slots but retain the original column descriptor.
+     * Never decode them as that column's encoded/variable-length payload. */
+    scope.Observe(tids->m_vals, (Size)rows * sizeof(ScalarValue), DA_INPUT, DA_READ);
     for (int row = 0; row < rows; ++row) {
         uint32 index = cu->imcsDesc != NULL ? *(uint32*)(tids->m_vals + row) - 1 :
             ItemPointerGetOffsetNumber((ItemPointer)(tids->m_vals + row)) - 1;
@@ -654,7 +659,14 @@ void OperatorDataAccessCULate(CU* cu, ScalarVector* tids, ScalarVector* output, 
             (attlen == -1 ? VARSIZE_ANY(cu->m_srcData + offset) : strlen(cu->m_srcData + offset) + 1);
         scope.Observe(cu->m_srcData + offset, length, DA_CU_VALUES, DA_READ);
     }
-    scope.ObserveVector(tids, 0, rows, DA_INPUT, DA_READ, true);
+}
+
+void OperatorDataAccessCULateOutput(ScalarVector* output, int rows)
+{
+    if (currentFrame == NULL || !u_sess->attr.attr_sql.enable_intra_operator_data_access)
+        return;
+    /* The input scope already accounts for this scan's calls and rows. */
+    OperatorDataAccessScope scope(currentFrame->node, DA_SCAN_ACCESS, 0);
     scope.ObserveVector(output, 0, rows, DA_BATCH, DA_WRITE, true);
 }
 

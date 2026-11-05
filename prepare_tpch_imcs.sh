@@ -1,6 +1,7 @@
 #!/bin/bash
 # Usage: ./prepare_tpch_imcs.sh generate|create|load|populate|status|all
 # generate : generate tpch table data | create : create table partitions in database system | load : load table data to database | populate : load all column data into memory | all : one-shot flow  
+set -eo pipefail
 
 sf=${SCALE_FACTOR:-100}
 partitions=${PARTITIONS:-192} # as core numbers

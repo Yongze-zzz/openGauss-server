@@ -2,6 +2,7 @@
 # Usage: ./run_imcs_queries.sh partition|numa|test
 # partition: IMCS partition scan; numa: NUMA-aware IMCS partition scan.
 # test: warm up both modes, then compare them with the same queries and DOP.
+set -eo pipefail
 
 source_dir=${SOURCE_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
 install_dir=${INSTALL_DIR:-$source_dir/mppdb_temp_install}
@@ -35,8 +36,13 @@ run_query() {
         echo 'SET statement_timeout = 0;'
         echo 'SET client_min_messages = warning;'
         echo 'SET enable_vector_engine = on;'
+        echo 'SET enable_codegen = on;'
+        echo 'SHOW enable_codegen;'
+        echo 'SHOW codegen_cost_threshold;'
         echo 'SET enable_imcsscan = on;'
         echo 'SET enable_cstore_partition_lane_scan = off;'
+        echo 'SET enable_intra_operator_data_access = off;'
+        echo 'SET enable_inter_operator_data_access = off;'
         echo "SET query_dop = $dop;"
         echo 'SET enable_imcs_partition_scan = on;'
         echo "SET enable_numa_aware_partition_scan = $numa;"
@@ -44,9 +50,9 @@ run_query() {
             echo "SET imcs_partition_scan_cpus = :'scan_cpus';"
         fi
 
-        # Save an EXPLAIN ANALYZE warm-up, then time only the measured SELECT.
+        # Save an EXPLAIN PERFORMANCE warm-up with LLVM details, then time the measured SELECT.
         if [[ $run == plan ]]; then
-            echo 'EXPLAIN ANALYZE'
+            echo 'EXPLAIN PERFORMANCE'
         else
             echo '\timing on'
         fi

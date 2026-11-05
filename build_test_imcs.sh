@@ -39,6 +39,8 @@ build() {
     export LD_LIBRARY_PATH="$gcc_dir/isl/lib:$gcc_dir/mpc/lib:$gcc_dir/mpfr/lib:$gcc_dir/gmp/lib:$binarylibs/kernel/platform/python3.7/lib:$LD_LIBRARY_PATH"
     export CPLUS_INCLUDE_PATH="/usr/include/libxml2:$JAVA_HOME/include:$JAVA_HOME/include/linux:$binarylibs/kernel/platform/python3.7/include/python3.7m:$binarylibs/kernel/dependency/llvm/comm/include:${CPLUS_INCLUDE_PATH:-}"
     export C_INCLUDE_PATH="/usr/include/libxml2:$JAVA_HOME/include:$JAVA_HOME/include/linux:${C_INCLUDE_PATH:-}"
+    # Perl 5.26+ no longer searches the current directory for required helpers.
+    export PERL5LIB="$source_dir/src/common/backend/utils/mb/Unicode${PERL5LIB:+:$PERL5LIB}"
 
     # Follow the repository's single-node CMake build with HTAP and NUMA enabled.
     "${CMAKE_BIN:-cmake}" -S "$source_dir" -B "$build_dir" \

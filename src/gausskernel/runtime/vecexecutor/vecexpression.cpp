@@ -3305,11 +3305,11 @@ ScalarVector* ExecVecQual(List* qual, ExprContext* econtext, bool resultForNull,
             ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("Invalid clause in qual")));
 
         qual_result = VectorExprEngine(clause, econtext, econtext->ecxt_scanbatch->m_sel, pVector, NULL);
+        rows = qual_result->m_rows;
 #ifdef ENABLE_HTAP
         if (unlikely(operator_data_access_active))
             OperatorDataAccessReadVector(qual_result, econtext->ecxt_scanbatch->m_sel, 0, rows);
 #endif
-        rows = qual_result->m_rows;
         pVal = qual_result->m_vals;
         pFlag = qual_result->m_flag;
         // use pSel to control if a record should go into next qual.

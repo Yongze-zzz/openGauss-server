@@ -81,7 +81,8 @@ extern void OperatorDataAccessJitInputs(PlanState* node, void* expression, ExprC
 extern void OperatorDataAccessJitBatch(PlanState* node, VectorBatch* batch, void* expression);
 extern void OperatorDataAccessCU(CU* cu, ScalarVector* output, int begin, int end,
     int rowCursor, int rows, int deadRows, int attlen, bool hasDeadRow);
-extern void OperatorDataAccessCULate(CU* cu, ScalarVector* tids, ScalarVector* output, int rows, int attlen);
+extern void OperatorDataAccessCULate(CU* cu, ScalarVector* tids, int attlen);
+extern void OperatorDataAccessCULateOutput(ScalarVector* output, int rows);
 extern ScalarVector* OperatorDataAccessEval(ExprState* expression, ExprContext* context,
     bool* selection, ScalarVector* output, ExprDoneCond* done);
 

@@ -2559,6 +2559,11 @@ void CStore::FillVectorLateRead(
     CU* cuPtr = this->GetCUData(cuDescPtr, colIdx, attlen, slotId);
     CSTORESCAN_TRACE_END(GET_CU_DATA_LATER_READ);
 
+#ifdef ENABLE_HTAP
+    if (unlikely(operator_data_access_active))
+        OperatorDataAccessCULate(cuPtr, tids, attlen);
+#endif
+
     if (cuPtr->HasNullValue()) {
         pos = cuPtr->ToVectorLateRead<attlen, true>(tids, vec);
     } else {
@@ -2567,7 +2572,7 @@ void CStore::FillVectorLateRead(
 #ifdef ENABLE_HTAP
     if (unlikely(operator_data_access_active)) {
         vec->m_rows = pos;
-        OperatorDataAccessCULate(cuPtr, tids, vec, pos, attlen);
+        OperatorDataAccessCULateOutput(vec, pos);
     }
 #endif
 
