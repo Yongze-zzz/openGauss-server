@@ -39,6 +39,7 @@
 #include "access/htap/imcucache_mgr.h"
 #include "access/htap/ss_imcucache_mgr.h"
 #include "access/htap/imcs_hash_table.h"
+#include "access/htap/imcs_adaptive.h"
 #include "access/htap/imcustorage.h"
 #include "access/htap/imcs_ctlg.h"
 #include "access/htap/imcstore_delta.h"
@@ -468,6 +469,7 @@ void IMCStoreVacuumWorkerMain(void)
             MemoryContextSwitchTo(backcontext);
         }
         CHECK_FOR_INTERRUPTS();
+        ImcsAdaptTick();
 
         if (!g_instance.imcstore_cxt.vacuum_queue->Dequeue(target)) {
             ++retry;
@@ -477,7 +479,7 @@ void IMCStoreVacuumWorkerMain(void)
 
             retry = 0;
             rc = WaitLatch(&g_instance.imcstore_cxt.vacuum_latch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-                (long)VACUMM_WAIT_TIME);
+                ImcsAdaptWaitMs()); /* Preserve normal idle waits when Adapt is disabled. */
             if (rc & WL_POSTMASTER_DEATH) {
                 break;
             }

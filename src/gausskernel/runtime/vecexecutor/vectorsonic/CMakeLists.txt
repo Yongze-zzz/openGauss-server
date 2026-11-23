@@ -1,4 +1,5 @@
 #This is the main CMAKE for build all components.
+# Include the shared Sonic Aggregate implementation in the vector executor.
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR} TGT_vectorsonic_SRC)
 
 set(TGT_vectorsonic_INC 

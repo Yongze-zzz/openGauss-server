@@ -79,7 +79,7 @@ static int ExecutionNode(OperatorDataAccessStats* stats)
     int savedErrno = errno;
     unsigned int node = 0;
     ++stats->cpuSamples;
-    int result = syscall(SYS_getcpu, NULL, &node, NULL) == 0 ? (int)node : -1;
+    int result = syscall(SYS_getcpu, NULL, &node, NULL) == 0 ? (int)node : DA_NODE_UNKNOWN;
     errno = savedErrno;
     return result;
 }
@@ -116,13 +116,13 @@ OperatorDataAccessScope::OperatorDataAccessScope(PlanState* node, OperatorDataAc
     m_key.targetWorker = targetWorker;
     m_key.operation = operation;
     m_key.object = m_key.access = -1;
-    if (executionNode == -2 && currentFrame != NULL && currentFrame->node == node) {
-        if (currentFrame->executionNode == -2)
+    if (executionNode == DA_NODE_NOT_OBSERVED && currentFrame != NULL && currentFrame->node == node) {
+        if (currentFrame->executionNode == DA_NODE_NOT_OBSERVED)
             currentFrame->executionNode = ExecutionNode(m_stats);
         executionNode = currentFrame->executionNode;
     }
-    m_key.executionNode = executionNode == -2 ? ExecutionNode(m_stats) : executionNode;
-    m_key.pageNode = -2;
+    m_key.executionNode = executionNode == DA_NODE_NOT_OBSERVED ? ExecutionNode(m_stats) : executionNode;
+    m_key.pageNode = DA_NODE_NOT_OBSERVED;
     if (rows != 0)
         RecordCall(rows);
 }
@@ -229,7 +229,7 @@ void OperatorDataAccessScope::Flush()
     struct ResolvedPage { int node, index; } resolved[64];
     for (int i = 0; i < m_buffer->count; ++i) {
         pages[i] = (void*)m_buffer->pages[i].address;
-        nodes[i] = -1;
+        nodes[i] = DA_NODE_UNKNOWN;
     }
     ++m_stats->pageQueries;
     /* A NULL destination-node array only queries placement; addresses are unique. */
@@ -240,7 +240,7 @@ void OperatorDataAccessScope::Flush()
             m_stats->firstErrno = errno;
     }
     for (int i = 0; i < m_buffer->count; ++i)
-        resolved[i] = {result < 0 || nodes[i] < 0 ? -1 : nodes[i], i};
+        resolved[i] = {result < 0 || nodes[i] < 0 ? DA_NODE_UNKNOWN : nodes[i], i};
     std::sort(resolved, resolved + m_buffer->count,
         [](const ResolvedPage& left, const ResolvedPage& right) { return left.node < right.node; });
     for (int begin = 0; begin < m_buffer->count;) {
@@ -374,7 +374,7 @@ void OperatorDataAccessEnter(OperatorDataAccessFrame* frame, PlanState* node)
     frame->stateScope = NULL;
     frame->jitStateScope = NULL;
     frame->expressionDepth = 0;
-    frame->executionNode = -2;
+    frame->executionNode = DA_NODE_NOT_OBSERVED;
     currentFrame = frame;
     operator_data_access_active = true;
 }
@@ -491,8 +491,9 @@ void OperatorDataAccessLeave(OperatorDataAccessFrame* frame, VectorBatch* result
             key.peerPlan = frame->previous->node->plan->plan_node_id;
             key.sourceWorker = key.targetWorker = stats->worker;
             key.operation = DA_BATCH_HANDOFF;
-            key.object = key.access = key.executionNode = -1;
-            key.pageNode = -2; /* Intentionally unobserved, distinct from a failed page query (-1). */
+            key.object = key.access = -1;
+            key.executionNode = DA_NODE_UNKNOWN;
+            key.pageNode = DA_NODE_NOT_OBSERVED;
             AddRecord(stats, key, 0, 0, 1, result->m_rows);
             key.object = DA_BATCH;
             key.access = DA_DELIVERED;
@@ -672,7 +673,7 @@ void OperatorDataAccessCULateOutput(ScalarVector* output, int rows)
 
 OperatorDataAccessStreamBatch::OperatorDataAccessStreamBatch(int channels)
     : m_previous(currentStreamBatch), m_node(OperatorDataAccessCurrentNode()), m_slots(NULL),
-      m_channels(channels), m_executionNode(-1)
+      m_channels(channels), m_executionNode(DA_NODE_UNKNOWN)
 {
     if (m_node == NULL)
         return;
@@ -792,7 +793,7 @@ void OperatorDataAccessFlush(EState* estate)
         bool inter = input || handoff || key.operation == DA_STREAM_SEND || key.operation == DA_STREAM_RECV;
         int producer = input ? key.peerPlan : (handoff || key.operation == DA_STREAM_SEND ? key.plan : 0);
         int consumer = handoff ? key.peerPlan : (key.operation == DA_STREAM_SEND ? 0 : key.plan);
-        const char* locality = key.pageNode == -2 ? "not_observed" :
+        const char* locality = key.pageNode == DA_NODE_NOT_OBSERVED ? "not_observed" :
             (key.executionNode < 0 || key.pageNode < 0 ? "unknown" :
             (key.executionNode == key.pageNode ? "local" : "remote"));
         ereport(LOG, (errmsg("operator_data_access record=%s query_id=%lu tid=%ld worker_id=%d instance=%p "

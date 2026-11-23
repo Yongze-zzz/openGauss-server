@@ -1,262 +1,187 @@
-# Experimental code for *Rethinking Data Locality in Operator-Parallel OLAP on Chiplets-Based CPUs: [Experiments & Analysis]*
+# Rethinking Data Locality in Operator-Parallel OLAP on Chiplets-Based CPUs
 
-This repository contains the openGauss code used to study data locality in operator-parallel OLAP. The current experiment set has two parts:
+This artifact accompanies the paper's experimental study of memory locality and shared-cache behavior in openGauss. It contains the modified engine, scripts for TPC-H SF100 experiments, and archived measurements for offline analysis. The database experiments use a Kunpeng 920 with four sockets, eight chiplets, and 24 cores per chiplet.
 
-1. data-access instrumentation for intra- and inter-operator data access; and
-2. an in-memory column store (IMCS) partition-scan baseline and a chiplet-aware partition-scan variant.
+[Paper PDF](_Experiment__Analysis__and_Benchmark__Rethinking_Data_Locality_in_Operator_Parallel_OLAP_on_Chiplets_Based_CPUs-15.pdf) · [Asset map](ASSETS.md) · [Figure scripts](assets/) · [Experiment commands](reproduction/paper/README.md) · [Engine setup](docs/reproduction/imcs_setup.md) · [GUC reference](#guc-reference)
 
-In our experiment, the IMCS modes use the same populated data, query inputs, and degree of parallelism. A session GUC selects the scan policy after one build. No recompilation is needed when switching between the baseline and chiplet-aware runs.
+## Plot the archived results
 
-| Experiment                        | Main session switches                                                       | What it measures                                                                                                 |
-| --------------------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Intra-operator data access       | `enable_intra_operator_data_access=on`                                    | Reads and writes to state owned by one operator, including Sonic HashAgg/HashJoin state                          |
-| inter-operator data access        | `enable_inter_operator_data_access=on`                                    | Data handed from a producer operator to its consumer through vectors, batches, copies, and local Stream exchange |
-| IMCS partition-scan baseline      | `enable_imcs_partition_scan=on`, `enable_numa_aware_partition_scan=off` | Whole-partition assignment using the existing worker placement                                                   |
-| Chiplet-aware IMCS partition scan | `enable_imcs_partition_scan=on`, `enable_numa_aware_partition_scan=on`  | Partition assignment and worker CPU affinity guided by the NUMA node holding each partition                      |
-
-## 1. Experimental setup
-
-The reference evaluation uses openGauss RC7.0.0 with TPC-H SF100 on a Kunpeng 920 server: four sockets, eight NUMA nodes, 192 physical cores, and 1 TiB of memory. The commands below use 192 partitions and DOP 192. Change the CPU lists, scale factor, partition count, and DOP to match the machine under test.
-
-The host should provide Linux NUMA support, the openGauss third-party binary libraries for its architecture, GCC 10.3, CMake 3.16.5 or later, OpenJDK 11, and the `libnuma` and `libxml2` development packages. TPC-H `dbgen` is expected in the tool directory referenced by `DBGEN_DIR`.
-
-Run the commands from the repository root and keep these variables in the same shell. The first three paths are local installation choices; the scripts also provide machine-specific defaults.
+Run from the repository root with Python 3.11. Install the plotting dependencies once.
 
 ```bash
-export BINARYLIBS="$HOME/binarylibs"
-export TPCH_ROOT="$HOME/TPCH-openGauss-TestTools"
-export PGDATA="$HOME/gauss-data"
-
-export SCALE_FACTOR=100
-export PARTITIONS=192
-export DOP=192
-export RUNS=3
-export DB_NAME=tpch
-export PORT=19999
-export SCHEMA="tpch_sf${SCALE_FACTOR//./_}_imcs_h${PARTITIONS}"
-export DBGEN_DIR="$TPCH_ROOT/TPC-H_Tools_v3.0.0/dbgen"
-export DATA_DIR="$HOME/tpch-data/sf${SCALE_FACTOR}"
-
-export INSTALL_DIR="$PWD/mppdb_temp_install"
-export GCC_PATH="$BINARYLIBS/buildtools/gcc10.3"
-export GAUSSHOME="$INSTALL_DIR"
-export GSQL_BIN="$INSTALL_DIR/bin/gsql"
-export PATH="$INSTALL_DIR/bin:$GCC_PATH/gcc/bin:$PATH"
-export LD_LIBRARY_PATH="$INSTALL_DIR/lib:$GCC_PATH/gcc/lib64:$BINARYLIBS/kernel/dependency/openssl/comm/lib:${LD_LIBRARY_PATH:-}"
+pip3 install -r assets/requirements.txt
+python3 assets/nps_adapt/fig11.py
 ```
 
-Use the same values of `SCALE_FACTOR`, `PARTITIONS`, `DOP`, and `SCHEMA` for data preparation and for both scan modes. The data-access statistics are independent of the IMCS scan switch, so they can be enabled in either scan mode when the access pattern itself is the subject of the experiment.
+The example writes a tightly cropped PDF of Fig. 11 to `results/paper_figures/`. The scripts in `assets/` are grouped by experiment, and each archived figure script contains its own plot values. Fig. 4(a) takes the working-set sweep from a new benchmark run. [Figure commands and data sources](ASSETS.md)
 
-## 2. Build and start the database
+## Run the experiments
 
-Build, initialize, and start the single-node instance as follows:
+Start with the three standalone Fig. 4 benchmarks. For the database experiments, build openGauss with HTAP and NUMA support, load TPC-H SF100, and start the instance with the CPU pool and memory binding for the selected chiplet count. The experiment commands use 4 chiplets/DOP96 or 8 chiplets/DOP168 and 100 GB `work_mem`. [Experiment commands](reproduction/paper/README.md) · [Engine setup](docs/reproduction/imcs_setup.md)
+
+### Operator memory access
+
+The access profiler counts logical reads and writes. Intra-operator records cover scans, private state, and workspaces. Inter-operator records cover consumption of upstream batches and Stream copies. Matrix rows identify executing chiplets and columns identify memory homes. Run query timing separately with both access counters and cache tracing off. [Access profiling and timing](reproduction/paper/README.md#database-access-and-timing) · [Access instrumentation](docs/analysis/imcs_access_and_cache_tracing.md#算子内与算子间访存)
+
+### Cache tracking
+
+The trace records per-thread LLC read misses and retired instructions alongside the wall time of plan nodes. The replay uses the saved CPU-to-LLC mapping to plot operator activity and LLC read-miss MPKI per chiplet. MPKI belongs to the sampled thread window. The paper compares 2 and 8 chiplets. The bundled timeline uses a separate 4/8-chiplet run. [Cache tracking and Table II inputs](ASSETS.md) · [Trace format and replay](docs/analysis/imcs_access_and_cache_tracing.md#缓存跟踪)
 
 ```bash
-bash build_test_imcs.sh build
-bash build_test_imcs.sh init
-bash build_test_imcs.sh start
+# On the 8-chiplet instance with the NPS layout populated
+RESET_LAYOUT=manual CACHE_INTERVAL_US=100000 QUERIES="1 9 14 21" bash run_nps_cache_trace.sh 8
 ```
 
-`build` enables the HTAP and NUMA components and installs the server into `INSTALL_DIR`. `init` runs `gs_initdb` and creates the data directory named by `PGDATA`. `start` installs the experiment configuration, starts the server, and creates `DB_NAME` if it does not exist. The combined command is:
+### Intra-operator cache optimization
+
+Compare Sonic, private Radix Hash Join (RHJ), and shared RHJ on the same NPS and Hotspot Splitting configuration. Private RHJ partitions each worker's build state. For an eligible shared build, workers in an LLC domain use the same build partitions and keep private probe workspaces. Inspect the plans and runtime counters to identify the actual path. [RHJ runner](reproduction/paper/run_rhj.sh) · [RHJ executor](src/gausskernel/runtime/vecexecutor/vectorsonic/vsonicradixjoin.cpp)
 
 ```bash
-bash build_test_imcs.sh all
+bash reproduction/paper/run_rhj.sh results/rhj_q8
 ```
 
-The default data directory in the script is `/mnt/nvme1p1/gauss`. Set `PGDATA=/mnt/nvme1p1/gauss` explicitly when that is the desired location. `config/imcs_reference.conf` is the reference configuration used by the script; it contains the memory, code-generation, and thread-pool settings used for this experiment. Before replacing `postgresql.conf`, the script saves a `postgresql.conf.before_imcs.*` copy. Run only the configuration step with:
+Shared Sonic Hash Aggregate routes incoming groups to partitioned states shared within an LLC. The configuration can also select a partition-local aggregate rewrite. Use the profile logs to distinguish these paths. The following commands prepare Q1, Q18, and Q21 SQL and compare the aggregate switch on the 8-chiplet instance. [Shared aggregation implementation](src/gausskernel/runtime/vecexecutor/vectorsonic/vsonicsharedagg.cpp) · [Aggregate runner](scripts/run_shared_sonic_agg.sh)
 
 ```bash
-bash build_test_imcs.sh configure
+SQL_ONLY=1 QUERIES="1 18 21" WARMUPS=0 RUNS=1 \
+  bash reproduction/paper/run_rhj.sh results/shared_agg_sql
+BASE_SQL_DIR="$PWD/results/shared_agg_sql/shared_rhj" PHASE=targets \
+  bash scripts/run_shared_sonic_agg.sh
 ```
 
-The server is launched with `numactl` when `NUMACTL_ARGS` is non-empty. For example:
+### Inter-operator placement and cache coordination
+
+Hotspot Splitting places local Stream buffers on producer chiplets. The replay measures how concurrent consumers change effective copy throughput. The Q5 coordination experiment keeps that data-placement policy, shared RHJ, CU balancing, Stream buffering, and shared Sonic Aggregate enabled. It compares in-lane aggregation, pipeline colocation, and pipeline colocation with an adaptive probe budget. Colocation preserves data ownership through eligible stages. The adaptive policy sizes and reuses probe buffers using the LLC budget and active operator state. [Stream replay and coordination commands](reproduction/paper/README.md#fig-13-stream-replay) · [Coordination modes](reproduction/paper/README.md#radix-hash-join-and-pipeline-coordination)
 
 ```bash
-export DOP=48
-export NUMACTL_ARGS="--physcpubind=0-47 --membind=0-1"
-bash build_test_imcs.sh start
+BASE_SQL_DIR="$PWD/reproduction/paper/sql" PHASE=chiplet_exchange \
+  EXCHANGE_MODES="fused pipeline_fused pipeline_adaptive" QUERIES=5 WARMUPS=2 RUNS=6 \
+  bash scripts/run_shared_sonic_agg.sh
 ```
 
-The default DOP 192 configuration uses `thread_pool_stream_attr='960,0.2'` and CPUs 0--191 on NUMA nodes 0--7. Set an empty `NUMACTL_ARGS` to disable the launcher. The binding must be applied to the database server; binding only the `gsql` client does not bind query workers.
+`pipeline_adaptive` sets `imcs_chiplet_exchange_mode = 'pipeline_colocation'`, `imcs_chiplet_probe_tile_policy = 'adaptive_budget_reuse'`, and `radix_partition_size_mb = 12`. The timing output is `timing.csv`, with a row for each mode and pair. Use the plan and profile modes to check plan rewrites and budget decisions. [Mode definitions](scripts/run_shared_sonic_agg.sh) · [Optimization design](docs/design/imcs_chiplet_optimizations.md)
 
-## 3. Prepare data for TPC-H evaluation
+## GUC reference
 
-### 3.1 Generate, create, and load the row-store tables
+The tables list this branch's experiment GUCs and the main openGauss settings used to run the experiments. Defaults are the values registered in the source. Runners set session values for each experiment. An enabled optimization can still select different execution paths by plan node. [SQL GUC definitions](src/common/backend/utils/misc/guc/guc_sql.cpp) · [Server GUC definitions](src/common/backend/utils/misc/guc.cpp)
 
-```bash
-bash prepare_tpch_imcs.sh generate
-bash prepare_tpch_imcs.sh create
-bash prepare_tpch_imcs.sh load
-```
+### Intra-operator memory placement and scan scheduling
 
-`generate` invokes TPC-H `dbgen` and writes the eight `.tbl` files below `DATA_DIR`. If the files already exist, point `DATA_DIR` at that directory and skip this step. `create` creates the TPC-H tables in `SCHEMA`; `customer`, `part`, `partsupp`, `orders`, and `lineitem` are hash-partitioned, while `region`, `nation`, and `supplier` are unpartitioned. `load` uses `\copy` and runs `ANALYZE`.
+| GUC | Default | Role |
+| --- | --- | --- |
+| `enable_imcsscan` | `off` | Enables IMCS scan plans. |
+| `enable_imcs_partition_scan` | `off` | Assigns whole IMCS partitions to parallel workers. |
+| `enable_numa_aware_partition_scan` | `off` | Uses NUMA-local workers for partition scans. Requires `enable_imcs_partition_scan`. |
+| `enable_imcs_nps` | `off` | Enables co-partitioned IMCS placement at populate time and locality-aware scheduling. |
+| `imcs_nps_groups` | `''` | Comma-separated `schema.table:key` members, with semicolons between groups. Populate validates the groups. |
+| `imcs_partition_scan_cpus` | `''` | Ordered, comma-separated CPU IDs for the scan worker pool. |
+| `imcs_partition_numa_map` | `''` | Comma-separated `partition_oid:numa_node` pairs for explicit CU placement during populate. |
+| `enable_imcs_adapt` | `off` | Enables Adapt with NPS, using CPU-load observations and background co-partition migration when migration is allowed. |
+| `enable_imcs_adapt_migration` | `on` | Permits Adapt monitoring and migration when Adapt is enabled. Set `off` for the affinity-only control. |
+| `imcs_adapt_period_ms` | `1000` | Adapt period in ms, range 20–60,000. |
+| `enable_imcs_local_task_queue` | `off` | Enables whole-partition claiming on eligible local scans with NPS and Adapt affinity, with migration off. |
+| `enable_imcs_nps_cu_balance` | `off` | Balances CU ranges within each NPS node on eligible scans, with Adapt and the local task queue off. |
 
-### 3.2 Place IMCS partitions on NUMA nodes
+### Intra-operator cache and hash state
 
-Inspect the CPU and NUMA topology before choosing the placement:
+| GUC | Default | Role |
+| --- | --- | --- |
+| `enable_sonic_hashjoin` | `on` | Allows the Sonic hash join executor. |
+| `enable_radix_hashjoin` | `off` | Selects the independent RHJ executor for eligible Sonic join plans. |
+| `radix_partition_size_mb` | `8` | Target build-partition size in MiB, range 1–1024. |
+| `radix_cache_aware` | `off` | Includes bucket, chain, and null storage in the radix working-set estimate. |
+| `radix_chiplet_aware` | `off` | Accounts for a worker's share of LLC in the partition budget. |
+| `radix_llc_size_mb` | `24` | Configured LLC capacity per chiplet in MiB, range 1–1024. |
+| `radix_shared_build` | `off` | Shares eligible local broadcast RHJ builds within an LLC. |
+| `enable_radix_shared_probe_locality` | `off` | Starts a probe tile with a ready partition that was recently probed in the LLC. |
+| `enable_radix_shared_probe_count` | `off` | Tracks active shared RHJ partitions independently of probe order. |
+| `enable_sonic_hashagg` | `on` | Allows the Sonic hash aggregate executor. |
+| `enable_imcs_shared_sonic_agg` | `off` | Enables LLC-local shared Sonic aggregation and eligible partition-local aggregate planning on NPS with Adapt off. |
 
-```bash
-lscpu -e=CPU,NODE,ONLINE
-numactl --hardware
-```
+### Inter-operator Stream placement and buffering
 
-`IMCS_PARTITION_NUMA_MAP` is a comma-separated list of `relation_oid:numa_node` pairs. The following query builds a map for the eight TPC-H tables and their leaf partitions, distributing objects in OID order across the selected nodes. Run it after `create`, because relation OIDs are assigned by the current database.
+| GUC | Default | Role |
+| --- | --- | --- |
+| `enable_imcs_stream_hotspot_split` | `off` | First-touches eligible local Stream buffers on NPS producer chiplets. Older SQL can use the alias `enable_imcs_stream_buffer_locality`. |
+| `enable_imcs_stream_batch_ring` | `off` | Gives a backpressured local vector redistribution channel a second buffer slot. |
+| `imcs_stream_batch_ring_extra_slots` | `16` | Caps extra slots per producer per Stream, range 0–1024. |
+| `enable_imcs_stream_consumer_placement` | `off` | Places a consumer once using sampled producer-buffer affinity and chiplet capacity. |
+| `enable_imcs_stream_hotflow_colocation` | `off` | Routes eligible single-key local redistribution through NPS chiplet lanes. |
+| `enable_imcs_stream_path_rebalance` | `off` | Spreads producer polling across chiplet lanes and offsets consumer polling order. |
+| `radix_shared_direct_send` | `off` | Sends eligible shared RHJ broadcasts only to open receiver channels. |
+| `radix_shared_preselect_builders` | `off` | Preselects one broadcast receiver per LLC for an eligible shared RHJ build. |
 
-```bash
-export NUMA_NODES=0,1,2,3,4,5,6,7
-export IMCS_PARTITION_NUMA_MAP=$(
-    "$GSQL_BIN" -X -q -A -t -v ON_ERROR_STOP=1 \
-        -d "$DB_NAME" -p "$PORT" -v "schema=$SCHEMA" -v "nodes=$NUMA_NODES" <<'SQL'
-WITH tables AS (
-    SELECT c.oid
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = :'schema'
-      AND c.relname IN ('region', 'nation', 'supplier', 'customer',
-                       'part', 'partsupp', 'orders', 'lineitem')
-), objects AS (
-    SELECT oid FROM tables
-    UNION ALL
-    SELECT p.oid FROM pg_partition p JOIN tables t ON p.parentid = t.oid
-    WHERE p.parttype = 'p'
-), numbered AS (
-    SELECT oid, row_number() OVER (ORDER BY oid) - 1 AS ordinal FROM objects
-), nodes AS (
-    SELECT string_to_array(:'nodes', ',')::int[] AS ids
-)
-SELECT string_agg(oid::text || ':' ||
-    ids[1 + (ordinal % array_length(ids, 1))::int]::text, ',' ORDER BY oid)
-FROM numbered CROSS JOIN nodes;
-SQL
-)
-```
+### Inter-operator cache coordination
 
-### 3.3 Populate IMCS and verify completion
+| GUC | Default | Role |
+| --- | --- | --- |
+| `imcs_chiplet_exchange_mode` | `off` | Selects the plan rewrite for eligible exchanges and co-partitioned stages. |
+| `imcs_chiplet_stage_cpus` | `''` | CPU placement for eligible stages, formatted as `plan_node:cpu,cpu;plan_node:cpu,cpu`. |
+| `imcs_chiplet_probe_tile_policy` | `off` | Sets LLC budgeting and buffer reuse for eligible shared RHJ probes. The path requires NPS and runs with Adapt, consumer placement, and access profiling off. |
+| `enable_imcs_cache_coord` | `off` | Prefers ready local Stream batches during recent overlapping radix probes. |
+| `enable_imcs_cache_coord_llc_pressure` | `off` | Adds an estimated LLC-capacity test to Stream batch preference. |
+| `imcs_cache_coord_sample_interval` | `4` | Caps consecutive local Stream batches before preferring a ready remote batch, range 1–64. |
+| `enable_imcs_cache_probe_coord` | `off` | Briefly yields large radix probes under sampled LLC pressure. |
+| `enable_imcs_cache_harmful` | `off` | Detects LLC-local overlap of scans, aggregate updates, and radix probes. |
+| `enable_imcs_cache_harmful_defer` | `off` | Allows brief probe deferral on a detected overlap. |
+| `enable_imcs_rhj_overlap_prefetch` | `off` | Prefetches buckets for a selected shared RHJ probe during local peer overlap. |
+| `enable_imcs_rhj_overlap_match_yield` | `off` | Allows the selected shared RHJ match stage to yield during local peer overlap. |
+| `imcs_rhj_stream_schedule_llc` | `-1` | Selects a receive-scheduling LLC. `-1` disables scheduling and `-2` applies per-LLC copy admission to all LLCs when copy slots are set. |
+| `imcs_rhj_stream_copy_slots` | `0` | Soft cap on concurrent large Stream copies per LLC, range 0–128. Zero selects ready-batch ordering on a selected LLC. |
+| `imcs_agg_cache_slots` | `0` | Soft cap on overlapping aggregate updates per LLC, range 0–128. Zero disables the cap. |
+| `enable_imcs_agg_cache_window` | `off` | Splits update slots by branch and periodically changes preference. |
+| `enable_imcs_agg_cache_borrow` | `off` | Allows the other aggregate to borrow unused preferred slots. |
+| `enable_imcs_agg_cache_chiplet` | `off` | Uses LLC-local Stream demand and staggers branch preference across LLCs. |
+| `enable_imcs_agg_cache_live_pressure` | `off` | Gates windowed aggregate coordination on active state exceeding estimated LLC capacity. |
+| `enable_imcs_agg_cache_critical` | `off` | Gives priority to sustained downstream demand within the same LLC in chiplet-aware windowed mode. |
 
-Set the map before the first populate. It controls the NUMA placement of CU buffers; changing a scan GUC later does not move existing data. Repopulate the tables after changing the map.
+Use the following English values for the two policy GUCs.
 
-```bash
-export POPULATE_WORKERS=64
-bash prepare_tpch_imcs.sh populate
-bash prepare_tpch_imcs.sh status
-```
+| `imcs_chiplet_exchange_mode` | Behavior |
+| --- | --- |
+| `off` | Keeps normal plan construction. |
+| `owner_handoff` | Preserves the partition owner through eligible exchanges. |
+| `selective_build` | Builds eligible colocated joins from selective aggregate output. |
+| `in_lane_aggregate` | Places eligible aggregates and joins in the same execution lane. |
+| `pipeline_colocation` | Preserves partition ownership across eligible join stages. |
+| `broadcast_isolation` | Restricts eligible broadcast stages to selected CPUs. |
 
-`status` reads `pg_catalog.query_imcstore_views()`. Every table must report `populated = complete = expected` and `root_status = COMPLETE`. With 192 partitions, a partitioned table normally has 193 IMCS objects including its root and an unpartitioned table has one. Use one populated data set for the baseline and chiplet-aware scans so that the scheduling policy is the only changed factor.
+| `imcs_chiplet_probe_tile_policy` | Behavior |
+| --- | --- |
+| `off` | Uses the normal probe workspace policy. |
+| `fixed_budget` | Sizes tiles using LLC capacity and the shared build partitions. |
+| `aggregate_aware` | Accounts for active aggregate state in the LLC. |
+| `peer_aware` | Accounts for active aggregate state and other shared RHJ state. |
+| `fixed_budget_reuse` | Uses a fixed budget and reuses probe buffers. |
+| `adaptive_budget_reuse` | Adjusts the budget under LLC-local pressure and reuses probe buffers. |
 
-## 4. Experiments
+### Profiling and overlap selection
 
-### 4.1 Data-access statistics
+| GUC | Default | Role |
+| --- | --- | --- |
+| `enable_intra_operator_data_access` | `off` | Records operator-local logical accesses. |
+| `enable_inter_operator_data_access` | `off` | Records producer-consumer accesses, batch handoffs, and Stream copies. |
+| `enable_cache_trace` | `off` | Records per-thread LLC counters and plan-node activity. |
+| `cache_trace_interval_us` | `100000` | Regular trace interval in µs, range 2,000–1,000,000. |
+| `enable_imcs_shared_sonic_agg_stats` | `off` | Logs aggregate execution paths and worker-level statistics. |
+| `imcs_rhj_overlap_victim_node` | `0` | Plan-node ID of the RHJ probe to observe or coordinate. |
+| `imcs_rhj_overlap_peer_node` | `0` | Plan-node ID of the overlapping stage. |
+| `imcs_rhj_overlap_peer_kind` | `0` | Selects a radix probe (`0`), aggregate update (`1`), or Stream receive copy (`2`) as the peer. |
 
-The statistics layer is controlled by two independent GUCs. Both default to `off` and should be disabled for timing runs.
+For timed runs, turn off tracing and access statistics. Check the server launch environment as well. `OG_CACHE_TRACE` can enable tracing independently of the session, and `OG_CACHE_TRACE_INTERVAL_US` can override the session interval. [Tracing implementation](src/gausskernel/runtime/vecexecutor/vec_cache_trace.cpp)
 
-```sql
-SET enable_intra_operator_data_access = on;
-SET enable_inter_operator_data_access = on;
-```
+### Supporting openGauss settings
 
-The instrumentation records logical byte ranges and the NUMA node containing the touched pages. It does not claim to be an LLC-miss or DRAM-bandwidth counter. Enable `enable_codegen = off` when the goal is to inspect ordinary C++ operator paths; JIT candidate records are still available when code generation is enabled.
-
-#### 4.1.1 Intra-opperator data access
-
-The operator-internal path measures memory owned and reused inside one operator. `VectorEngine()` creates an `OperatorDataAccessFrame` for the current `PlanState`. The frame owns reusable scopes for the operator state, expression evaluation, and JIT candidates. A scope accumulates calls, rows, logical bytes, and address ranges; it does not allocate or look up a statistics object for every row.
-
-The Sonic hash operators use the scope directly. `vsonichash.cpp` resolves the data and NULL pages of a Sonic array. `vsonichashagg.cpp` records bucket reads/writes, next-link accesses, transition-state reads/writes, and JIT candidate state. `vsonichashjoin.cpp` records build bucket/next writes and probe-chain reads. A Sonic hash table is therefore observed at the points where it is accessed; the statistics pass does not traverse the entire hash table a second time.
-
-For each observed address range, `OperatorDataAccessBuffer` hashes page addresses into a small in-query buffer. It sends the unique pages in the current batch to `move_pages()`, groups the returned locations by NUMA node and access role, and then flushes the buffer. The buffer is a batching mechanism, not a cap on the experiment: a full batch is flushed and the same scope continues with the next pages. Repeated reads remain repeated logical bytes, while page-location accounting is aggregated by page.
-
-Run a query with only the intra-operator dimension enabled:
-
-```sql
-SET search_path TO tpch_sf100_imcs_h192;  -- replace with SCHEMA
-SET enable_vector_engine = on;
-SET enable_imcsscan = on;
-SET enable_imcs_partition_scan = on;
-SET enable_numa_aware_partition_scan = off;
-SET enable_intra_operator_data_access = on;
-SET enable_inter_operator_data_access = off;
-SET enable_codegen = off;
-\i SQL/queries/q1.sql
-```
-
-The server log entries use the `operator_data_access` prefix and identify the plan node, operator, object, access role, logical range, page NUMA node, calls, and rows. `DA_OPERATOR_STATE`, `DA_SONIC_AGG_TRANSITION`, and the Sonic hash roles are the main records for this dimension.
-
-#### 4.1.2 Inter-operator data access
-
-The inter-operator path follows a value from its producer to its consumer. When a plan node leaves `VectorEngine()`, the frame registers the result vector and its producer plan ID in the parent frame. A consumer read matches its vector and flag addresses to that producer record. The match remains valid across a shallow pointer handoff, so a consumer can be charged for data that was not deep-copied.
-
-Copy and exchange paths are recorded separately. `OperatorDataAccessBatchCopy()` records source and destination vector slots and the copied payload. `OperatorDataAccessStreamCopy()` records local Stream send/receive handoff. `OperatorDataAccessReadBatch()` records a consumer reading an input batch. These records distinguish direct pointer reuse, a deep payload copy, and a Stream transfer; they are not collapsed into one generic copy event.
-
-Run the same query with only the inter-operator dimension enabled:
-
-```sql
-SET search_path TO tpch_sf100_imcs_h192;  -- replace with SCHEMA
-SET enable_vector_engine = on;
-SET enable_imcsscan = on;
-SET enable_imcs_partition_scan = on;
-SET enable_numa_aware_partition_scan = off;
-SET enable_intra_operator_data_access = off;
-SET enable_inter_operator_data_access = on;
-SET enable_codegen = off;
-\i SQL/queries/q1.sql
-```
-
-Use `producer_plan_id`, `consumer_plan_id`, `DA_CONSUMER_INPUT`, `DA_BATCH_HANDOFF`, `DA_BATCH_COPY`, `DA_STREAM_SEND`, and `DA_STREAM_RECV` to group the result by an operator edge. This gives an operator-to-operator view even when the data remains in the same buffer and only its pointer is passed onward.
-
-### 4.2 Memory-access optimization: IMCS and IMCS-Chiplet
-
-The scan experiment keeps the populated IMCS data fixed and changes only partition assignment and worker affinity. Both modes use the same partition iterator, partition transition code, and complete CU/delta scan path.
-
-#### 4.2.1 IMCS partition-scan baseline
-
-```bash
-export QUERIES="1 6"
-OUTPUT_DIR="$PWD/results/imcs-baseline" bash run_imcs_queries.sh partition
-```
-
-The driver sets `enable_vector_engine = on`, `enable_imcsscan = on`, `enable_cstore_partition_lane_scan = off`, `enable_imcs_partition_scan = on`, and `enable_numa_aware_partition_scan = off`. The baseline assigns complete partitions in round-robin order and retains the existing Stream worker placement.
-
-#### 4.2.2 Chiplet-aware IMCS partition scan
-
-Set an ordered CPU list that is valid in the server's affinity mask. It must contain at least DOP entries.
-
-```bash
-export IMCS_PARTITION_SCAN_CPUS="$(seq -s, 0 191)"
-OUTPUT_DIR="$PWD/results/imcs-numa" bash run_imcs_queries.sh numa
-```
-
-The chiplet-aware run enables both scan switches and sets `imcs_partition_scan_cpus`. It reads each partition's populated data NUMA node, assigns partitions to workers on that node, and restores the worker's previous affinity when the scan ends. This static version does not use a shared dynamic queue; its purpose is to isolate data placement and worker locality.
-
-#### 4.2.3 Paired comparison
-
-```bash
-export QUERIES="1 6 8 9 14 21"
-export OUTPUT_DIR="$PWD/results/imcs-$(date +%Y%m%d_%H%M%S)"
-bash run_imcs_queries.sh test
-```
-
-`test` warms up both modes with `EXPLAIN ANALYZE`, then runs each query `RUNS` times in both modes. Keep `SCALE_FACTOR`, `PARTITIONS`, `DOP`, data placement, server CPU binding, and memory settings unchanged. The IMCS scan switches are independent of the two data-access statistics switches; leave the latter off for timing.
-
-| GUC                                  | Set it                       | Role                                                                    |
-| ------------------------------------ | ---------------------------- | ----------------------------------------------------------------------- |
-| `imcs_partition_numa_map`          | Before `populate`          | Select the NUMA node for each mapped relation or partition's CU buffers |
-| `imcs_partition_scan_cpus`         | Before an IMCS-Chiplet query | Provide the ordered CPU IDs used by chiplet-aware scan workers          |
-| `enable_imcs_partition_scan`       | Query session                | Enable whole-partition IMCS assignment                                  |
-| `enable_numa_aware_partition_scan` | Query session                | Select chiplet-aware assignment and worker affinity                     |
-
-The current static implementation targets local, single-node, non-shared, one-level partition scans with DOP greater than one. It is intentionally separate from the later dynamic-queue and migration experiments.
-
-## 5. Code map and scope
-
-| Component                                                 | Main files                                                                                                                                                                                                                                                      |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Data-access frame, scopes, page batching, and log records | [operator_data_access.cpp](src/gausskernel/runtime/vecexecutor/operator_data_access.cpp), [operator_data_access.h](src/include/vecexecutor/operator_data_access.h)                                                                                                |
-| Executor and expression hooks                             | [vecexecutor.cpp](src/gausskernel/runtime/vecexecutor/vecexecutor.cpp), [vecexpression.cpp](src/gausskernel/runtime/vecexecutor/vecexpression.cpp), [vectorbatch.cpp](src/gausskernel/runtime/vecexecutor/vectorbatch.cpp)                                         |
-| Sonic HashAgg and HashJoin access points                  | [vsonichash.cpp](src/gausskernel/runtime/vecexecutor/vectorsonic/vsonichash.cpp), [vsonichashagg.cpp](src/gausskernel/runtime/vecexecutor/vectorsonic/vsonichashagg.cpp), [vsonichashjoin.cpp](src/gausskernel/runtime/vecexecutor/vectorsonic/vsonichashjoin.cpp) |
-| CU and IMCS access observation                            | [cstore_am.cpp](src/gausskernel/storage/cstore/cstore_am.cpp), [imcstore_am.cpp](src/gausskernel/storage/htap/imcstore_am.cpp)                                                                                                                                    |
-| IMCS placement and chiplet-aware scan assignment          | [imcs_partition_wise.cpp](src/gausskernel/storage/htap/imcs_partition_wise.cpp), [imcs_partition_wise.h](src/include/access/htap/imcs_partition_wise.h), [vecpartiterator.cpp](src/gausskernel/runtime/vecexecutor/vecnode/vecpartiterator.cpp)                    |
-| GUC registration                                          | [guc_sql.cpp](src/common/backend/utils/misc/guc/guc_sql.cpp), [knl_session_attr_sql.h](src/include/knl/knl_guc/knl_session_attr_sql.h)                                                                                                                            |
-| Reproducibility scripts                                   | [build_test_imcs.sh](build_test_imcs.sh), [prepare_tpch_imcs.sh](prepare_tpch_imcs.sh), [run_imcs_queries.sh](run_imcs_queries.sh)                                                                                                                                 |
-
-The data-access layer reports logical accesses and page locality. It does not replace hardware performance counters. The current IMCS-Chiplet experiment is a static partition assignment; dynamic shared queues, migration cost models, and other cache-level experiments remain separate work.
+| GUC | Usage in the experiments |
+| --- | --- |
+| `query_dop` | `96` for 4 chiplets and `168` for 8 chiplets. |
+| `work_mem` | `100GB` for the main database comparisons. |
+| `query_mem`, `query_max_mem` | Statement memory reservation and limit, reported in the timing settings. |
+| `enable_vector_engine`, `enable_codegen` | Enabled in the standard timing SQL. |
+| `enable_cstore_partition_lane_scan` | Disabled in the IMCS comparison SQL. |
+| `enable_thread_pool`, `thread_pool_attr`, `thread_pool_stream_attr` | Server startup settings generated for the active chiplet count. |
+| `numa_distribute_mode` | Set to `all` in the database experiments. |
+| `max_imcs_cache` | IMCS cache capacity, set at server start. The reference configuration uses `256GB`. |
 
 ## License
 

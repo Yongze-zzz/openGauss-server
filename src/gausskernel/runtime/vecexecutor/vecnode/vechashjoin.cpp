@@ -31,6 +31,7 @@
 #include "vecexecutor/vectorbatch.inl"
 #include "vectorsonic/vsonichash.h"
 #include "vectorsonic/vsonichashjoin.h"
+#include "vectorsonic/vsonicradixjoin.h"
 #include "postgres.h"
 #include "knl/knl_variable.h"
 #include "executor/executor.h"
@@ -55,8 +56,9 @@ extern bool CodeGenPassThreshold(double rows, int dn_num, int dop);
 extern bool anls_opt_is_on(AnalysisOpt dfx_opt);
 #define leftrot(x, k) (((x) << (k)) | ((x) >> (32 - (k))))
 
-#define IS_SONIC_HASH(node) (((HashJoin*)(node)->js.ps.plan)->isSonicHash)
-#define JOIN_NAME ((IS_SONIC_HASH(node)) ? "Sonic" : "")
+#define IS_SONIC_HASH(node) ((node)->hashExecutorKind == VEC_HASH_JOIN_SONIC)
+#define IS_RADIX_HASH(node) ((node)->hashExecutorKind == VEC_HASH_JOIN_RADIX)
+#define JOIN_NAME (IS_RADIX_HASH(node) ? "SonicRadix" : (IS_SONIC_HASH(node) ? "Sonic" : ""))
 
 VecHashJoinState* ExecInitVecHashJoin(VecHashJoin* node, EState* estate, int eflags)
 {
@@ -80,6 +82,11 @@ VecHashJoinState* ExecInitVecHashJoin(VecHashJoin* node, EState* estate, int efl
     hash_state->js.ps.state = estate;
     hash_state->js.ps.vectorized = true;
     hash_state->hashTbl = NULL;
+    /* Runtime choice is fixed for this PlanState, even for cached plans and
+     * subsequent SET operations. Eligibility remains the Sonic inner-join gate. */
+    hash_state->hashExecutorKind = node->isSonicHash ? VEC_HASH_JOIN_SONIC : VEC_HASH_JOIN_STANDARD;
+    if (node->isSonicHash && u_sess->attr.attr_sql.enable_radix_hashjoin && isSonicHashJoinEnable((HashJoin*)node))
+        hash_state->hashExecutorKind = VEC_HASH_JOIN_RADIX;
 
     /*
      * Miscellaneous initialization
@@ -224,7 +231,7 @@ VecHashJoinState* ExecInitVecHashJoin(VecHashJoin* node, EState* estate, int efl
     /* consider codegeneration for hashjoin node with respect to innerjoin,
      * buildhashtable and probehashtable function.
      */
-    if (consider_codegen && !node->isSonicHash) {
+    if (consider_codegen && hash_state->hashExecutorKind == VEC_HASH_JOIN_STANDARD) {
         dorado::VecHashJoinCodeGen::HashJoinCodeGen(hash_state);
     }
 #endif
@@ -239,7 +246,12 @@ VectorBatch* ExecVecHashJoin(VecHashJoinState* node)
     for (;;) {
         switch (node->joinState) {
             case HASH_BUILD: {
-                if (IS_SONIC_HASH(node)) {
+                if (IS_RADIX_HASH(node)) {
+                    if (node->hashTbl == NULL)
+                        node->hashTbl = New(CurrentMemoryContext) SonicRadixHashJoin(1024, node);
+                    ((SonicRadixHashJoin*)node->hashTbl)->Build();
+                    rows = ((SonicRadixHashJoin*)node->hashTbl)->getRows();
+                } else if (IS_SONIC_HASH(node)) {
                     if (node->hashTbl == NULL)
                         node->hashTbl = New(CurrentMemoryContext) SonicHashJoin(INIT_DATUM_ARRAY_SIZE, node);
 
@@ -279,7 +291,10 @@ VectorBatch* ExecVecHashJoin(VecHashJoinState* node)
                 instr_time start_time;
                 (void)INSTR_TIME_SET_CURRENT(start_time);
                 VectorBatch* result = NULL;
-                if (IS_SONIC_HASH(node)) {
+                if (IS_RADIX_HASH(node)) {
+                    result = ((SonicRadixHashJoin*)node->hashTbl)->Probe();
+                    ((SonicRadixHashJoin*)node->hashTbl)->m_probe_time += elapsed_time(&start_time);
+                } else if (IS_SONIC_HASH(node)) {
                     result = ((SonicHashJoin*)(node->hashTbl))->Probe();
                     ((SonicHashJoin*)(node->hashTbl))->m_probe_time += elapsed_time(&start_time);
                 } else {
@@ -290,7 +305,10 @@ VectorBatch* ExecVecHashJoin(VecHashJoinState* node)
                 if (BatchIsNull(result)) {
                     PlanState* plan_state = (PlanState*)node;
                     if (HAS_INSTR(&node->js, true)) {
-                        if (IS_SONIC_HASH(node))
+                        if (IS_RADIX_HASH(node))
+                            plan_state->instrument->sorthashinfo.hashagg_time =
+                                ((SonicRadixHashJoin*)node->hashTbl)->m_probe_time;
+                        else if (IS_SONIC_HASH(node))
                             plan_state->instrument->sorthashinfo.hashagg_time =
                                 ((SonicHashJoin*)(node->hashTbl))->m_probe_time;
                         else
@@ -319,7 +337,11 @@ void ExecEndVecHashJoin(VecHashJoinState* node)
     void* tbl = node->hashTbl;
 
     if (tbl != NULL) {
-        if (!IS_SONIC_HASH(node)) {
+        if (IS_RADIX_HASH(node)) {
+            SonicRadixHashJoin* hj_tbl = (SonicRadixHashJoin*)tbl;
+            hj_tbl->closeAllFiles();
+            hj_tbl->freeMemoryContext();
+        } else if (!IS_SONIC_HASH(node)) {
             HashJoinTbl* hj_tbl = (HashJoinTbl*)tbl;
 
             if (hj_tbl->m_buildFileSource) {
@@ -3830,7 +3852,11 @@ void HashJoinTbl::recordPartitionInfo(bool build_side, int file_idx, int istart,
 void ExecReScanVecHashJoin(VecHashJoinState* node)
 {
 
-    if (!IS_SONIC_HASH(node)) {
+    if (IS_RADIX_HASH(node)) {
+        SonicRadixHashJoin* hj_tbl = (SonicRadixHashJoin*)node->hashTbl;
+        if (hj_tbl != NULL)
+            hj_tbl->ResetNecessary();
+    } else if (!IS_SONIC_HASH(node)) {
         HashJoinTbl* hj_tbl = (HashJoinTbl*)node->hashTbl;
         if (hj_tbl != NULL)
             hj_tbl->ResetNecessary();
@@ -3864,7 +3890,11 @@ void ExecEarlyFreeVecHashJoin(VecHashJoinState* node)
     void* tbl = node->hashTbl;
 
     if (tbl != NULL) {
-        if (!IS_SONIC_HASH(node)) {
+        if (IS_RADIX_HASH(node)) {
+            SonicRadixHashJoin* hj_tbl = (SonicRadixHashJoin*)tbl;
+            hj_tbl->closeAllFiles();
+            hj_tbl->freeMemoryContext();
+        } else if (!IS_SONIC_HASH(node)) {
             HashJoinTbl* hj_tbl = (HashJoinTbl*)tbl;
             if (hj_tbl->m_buildFileSource) {
                 Assert(hj_tbl->m_probeFileSource);

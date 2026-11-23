@@ -30,9 +30,28 @@
 #include "vectorsonic/vsonichash.h"
 #include "vectorsonic/vsonicpartition.h"
 
+/* Only storage that survives a batch belongs to the LLC shard. */
+struct SonicAggSharedTable {
+    MemoryContext context;
+    SonicDatumArray** data;
+    SonicDatumArray* hashes;
+    SonicDatumArray* next;
+    SonicDatumArray* segments;
+    char* buckets;
+    int64 rows;
+    int64 hashSize;
+    int64 expandBytes;
+    int elementBytes;
+    int segmentCount;
+    bool segmented;
+    bool expandable;
+    bool spilling;
+};
+
 class SonicHashAgg : public SonicHash {
 public:
-    SonicHashAgg(VecAggState* node, int arrSize);
+    SonicHashAgg(VecAggState* node, int arrSize, SonicHashSource* partitionInput = NULL,
+        uint64 partitionBudget = 0, uint64 partitionRows = 0, bool directWorker = false);
     ~SonicHashAgg(){};
 
     /* Main sonic HashAgg function */
@@ -49,6 +68,20 @@ public:
 
     /* Reset current status */
     bool ResetNecessary(VecAggState* node);
+    uint64 GetPartitionBytes();
+    uint64 EstimateRecentStateBytes(uint64 groups, uint64 recentRows) const
+    {
+        return Min(groups, recentRows) * ((uint64)m_arrayElementSize + 2 * sizeof(uint32));
+    }
+    uint64 GetPartitionPeak() const { return m_partitionPeak; }
+    uint64 GetPartitionGroups() const { return m_partitionGroups; }
+    uint64 GetPartitionBuildNs() const { return m_partitionBuildNs; }
+    bool PartitionSpilled() const { return m_memControl.spillToDisk; }
+    void ClosePartitionFiles();
+    void HashSharedInput(VectorBatch* batch, uint32* hashes);
+    void InitSharedTable(SonicAggSharedTable& table, MemoryContext parent, uint64 budget, uint64 groups);
+    void AttachSharedTable(const SonicAggSharedTable& table, uint64 budget);
+    int UpdateSharedTable(SonicAggSharedTable& table, VectorBatch* batch, uint32* hashes, uint16* spillRows);
 
     /* Show number of partition files */
     int getFileNum()
@@ -140,6 +173,7 @@ private:
     void BuildScanBatchFinal(int idx);
 
     VectorBatch* ProducerBatch();
+    void SaveSharedTable(SonicAggSharedTable& table);
 
     void (SonicHashAgg::*m_buildScanBatch)(int idx);
 
@@ -282,5 +316,15 @@ private:
 
     /* handle duplicate, record the orginial the location. */
     uint32 m_orgLoc[BatchMaxSize];
+
+    /* Keep these after the fields described by the shipped LLVM IR. */
+    SonicHashSource* m_partitionInput;
+    uint64 m_partitionPeak = 0;
+    uint64 m_partitionGroups = 0;
+    uint64 m_partitionBuildNs = 0;
+    bool m_directWorker;
+    uint32* m_directHashes = NULL;
+    uint16* m_directSpillRows = NULL;
+    int m_directSpillCount = 0;
 };
 #endif

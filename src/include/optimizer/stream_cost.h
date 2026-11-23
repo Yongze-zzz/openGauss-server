@@ -86,6 +86,7 @@ typedef struct Stream {
                                 * used for recursive sql execution that under recursive-union operator. */
     ExecNodes* origin_consumer_nodes;
     bool is_recursive_local;   /* LOCAL GATHER for recursive */
+    bool chipletOwnerHandoff;  /* Producer and consumer use the same hash-bucket owners. */
 #ifdef USE_SPQ
     int streamID;
 #endif

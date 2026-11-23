@@ -44,10 +44,13 @@ typedef struct BloomFilterRuntime {
     filter::BloomFilter** bf_array; /* bloomfilter array. */
 } BloomFilterRuntime;
 
+enum VecHashJoinExecutorKind { VEC_HASH_JOIN_STANDARD = 0, VEC_HASH_JOIN_SONIC, VEC_HASH_JOIN_RADIX };
+
 typedef struct VecHashJoinState : public HashJoinState {
     int joinState;
 
     void* hashTbl;
+    VecHashJoinExecutorKind hashExecutorKind;
 
     FmgrInfo* eqfunctions;
 
@@ -146,6 +149,11 @@ typedef struct VecAggState : public AggState {
                                    * with sonic format */
     char* jitted_SortAggMatchKey; /* LLVM jitted function pointer */
 
+#ifdef ENABLE_HTAP
+    void* sharedAggRun;
+    bool sharedAggChecked;
+    bool sharedAggRewind;
+#endif
 } VecAggState;
 
 typedef struct VecWindowAggState : public WindowAggState {
@@ -405,8 +413,19 @@ struct VecNestLoopState : public NestLoopState {
     vecqual_func jitted_joinqual;
 };
 
+#ifdef ENABLE_HTAP
+struct ImcsPartitionCuRange {
+    uint32 first;
+    uint32 limit;
+};
+#endif
+
 typedef struct VecPartIteratorState : public PartIteratorState {
     int* partitionWiseWorkers; /* NUMA assignment by partition-list position; unused by plain partition scans. */
+    uint64 imcsLocalTaskGeneration;
+#ifdef ENABLE_HTAP
+    ImcsPartitionCuRange* partitionCuRanges;
+#endif
 } VecPartIteratorState;
 
 class BatchStore;

@@ -1,4 +1,5 @@
 #This is the main CMAKE for build bin.
+# Includes the IMCS NUMA decision core and its server runtime adapter and CPU-only monitor.
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR} TGT_htap_SRC)
 
 set(TGT_htap_INC 

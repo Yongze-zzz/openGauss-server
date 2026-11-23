@@ -459,7 +459,8 @@ static void AlterTableEnableImcstoreInternal(Relation rel, int2vector* imcsAttsN
 
 void AlterTableEnableImcstore(Relation rel, int2vector* imcsAttsNum, int imcsNatts, bool useShareMemroy)
 {
-    HTAB* dataNodes = ImcsPartitionWiseParseDataNodes();
+    HTAB* dataNodes = u_sess->attr.attr_sql.enable_imcs_nps ?
+        ImcsNpsBuildDataNodes(rel) : ImcsPartitionWiseParseDataNodes();
     PG_TRY();
     {
         AlterTableEnableImcstoreInternal(rel, imcsAttsNum, imcsNatts, useShareMemroy, dataNodes);
@@ -479,6 +480,8 @@ void EnableImcstoreForRelation(Relation rel, int2vector* imcsAttsNum, int imcsNa
 {
     IMCSDesc* desc = IMCS_HASH_TABLE->GetImcsDesc(RelationGetRelid(rel));
     desc->dataNumaNode = ImcsPartitionWiseDataNode(dataNodes, RelationGetRelid(rel));
+    pg_atomic_write_u32(&desc->currentNumaNode, (uint32)desc->dataNumaNode);
+    ImcsNpsSetIdentity(dataNodes, desc);
     if (desc->dataNumaNode >= 0 &&
         (ENABLE_DSS || !IS_SINGLE_NODE || g_instance.attr.attr_memory.enable_borrow_memory))
         ereport(ERROR, (errmsg("NUMA IMCS populate requires local, single-node IMCS without borrowed memory")));

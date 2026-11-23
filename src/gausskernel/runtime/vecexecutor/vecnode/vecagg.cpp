@@ -44,6 +44,7 @@
 #include "vecexecutor/vecexecutor.h"
 #include "vecexecutor/vecfunc.h"
 #include "vectorsonic/vsonichashagg.h"
+#include "vectorsonic/vsonicsharedagg.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "nodes/execnodes.h"
@@ -122,6 +123,9 @@ VecAggState* ExecInitVecAggregation(VecAgg* node, EState* estate, int eflags)
     Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
 
     aggstate = makeNode(VecAggState);
+#ifdef ENABLE_HTAP
+    aggstate->sharedAggRewind = (eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0;
+#endif
     aggstate->ss.ps.plan = (Plan*)node;
     aggstate->ss.ps.state = estate;
     aggstate->ss.ps.vectorized = true;
@@ -798,6 +802,14 @@ VectorBatch* ExecVecAggregation(VecAggState* node)
     }
 
     VecAgg* plan = (VecAgg*)(node->ss.ps.plan);
+#ifdef ENABLE_HTAP
+    if (u_sess->attr.attr_sql.enable_imcs_shared_sonic_agg && !node->sharedAggChecked) {
+        node->sharedAggChecked = true;
+        StartSonicSharedAgg(node);
+    }
+    if (node->sharedAggRun != NULL)
+        return RunSonicSharedAgg(node);
+#endif
     if (node->aggRun == NULL) {
         switch (plan->aggstrategy) {
             case AGG_PLAIN:
@@ -832,6 +844,11 @@ VectorBatch* ExecVecAggregation(VecAggState* node)
  */
 void ExecReScanVecAggregation(VecAggState* node)
 {
+#ifdef ENABLE_HTAP
+    if (node->sharedAggRun != NULL)
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot rescan a shared Sonic aggregate")));
+    node->sharedAggRewind = true;
+#endif
     bool reset_left_tree = false;
     VecAgg* plan = (VecAgg*)(node->ss.ps.plan);
 
@@ -863,6 +880,9 @@ void ExecReScanVecAggregation(VecAggState* node)
  */
 void ExecEndVecAggregation(VecAggState* node)
 {
+#ifdef ENABLE_HTAP
+    EndSonicSharedAgg(node);
+#endif
     PlanState* outer_plan = NULL;
 
     VecAgg* plan = (VecAgg*)(node->ss.ps.plan);
@@ -1714,6 +1734,9 @@ void BaseAggRunner::prepare_projection_batch()
  */
 void ExecEarlyFreeVecAggregation(VecAggState* node)
 {
+#ifdef ENABLE_HTAP
+    EndSonicSharedAgg(node);
+#endif
     PlanState* plan_state = &node->ss.ps;
     VecAgg* plan = (VecAgg*)node->ss.ps.plan;
 

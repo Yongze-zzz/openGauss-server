@@ -2095,7 +2095,7 @@ void ExecEndPlan(PlanState *planstate, EState *estate)
     }
 
     //add cache trace function
-    // VecCacheTraceFlush();
+    VecCacheTraceFlush();
 #ifdef ENABLE_HTAP
     OperatorDataAccessFlush(estate);
 #endif

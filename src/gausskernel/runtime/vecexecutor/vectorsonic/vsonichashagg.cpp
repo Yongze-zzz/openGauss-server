@@ -32,6 +32,280 @@
 #include "utils/dynahash.h"
 #include "utils/int8.h"
 #include "vecexecutor/operator_data_access.h"
+#ifdef ENABLE_HTAP
+#include "distributelayer/streamProducer.h"
+#include "vecexecutor/vec_cache_coord.h"
+#include "vecexecutor/vecexecutor.h"
+#include <sched.h>
+#include <time.h>
+
+namespace {
+struct alignas(128) AggCacheDomain {
+    uint32 locked;
+    uint32 active;
+    uint64 query;
+    uint64 lastSeen[2];
+    uint64 lastDenied[2];
+    uint64 stateBytes[2];
+    uint32 activeByMember[2];
+    StreamAggCacheDemand* demand[2];
+    uint64 windowEnd;
+    int preferred;
+    int previousCandidate;
+};
+
+AggCacheDomain aggCacheDomains[CPU_SETSIZE] = {};
+const uint64 aggCacheWindowNs = 2 * UINT64CONST(1000000);
+const uint64 aggCacheWaitingNs = 100 * UINT64CONST(1000);
+
+uint64 AggCacheNow(clockid_t clock = CLOCK_MONOTONIC)
+{
+    timespec ts;
+    clock_gettime(clock, &ts);
+    return (uint64)ts.tv_sec * UINT64CONST(1000000000) + ts.tv_nsec;
+}
+
+int AggCacheTarget(int node)
+{
+    const char* pair = gs_getenv_r("OG_IMCS_AGG_CACHE_PAIR");
+    if (pair == NULL)
+        return -1;
+    char* end = NULL;
+    long first = strtol(pair, &end, 10);
+    if (end == pair || *end != ',' || first <= 0)
+        return -1;
+    const char* secondText = end + 1;
+    long second = strtol(secondText, &end, 10);
+    if (end == secondText || *end != '\0' || second <= 0 || first == second)
+        return -1;
+    return node == first ? 0 : (node == second ? 1 : -1);
+}
+
+struct AggCacheWaitStats {
+    uint64 admitted;
+    uint64 waited;
+    uint64 waitNs;
+    uint64 bypassed;
+    uint64 windows;
+    uint64 demandWindows;
+    uint64 localWindows;
+    uint64 staggeredWindows;
+    uint64 borrowed;
+    uint64 idleSlotWaits;
+    uint64 admittedWithoutPressure;
+    uint64 usedSpareSlots;
+    uint64 priorityWindows;
+    uint64 priorityWaits;
+};
+
+struct AggCacheUpdateStats {
+    uint64 candidates;
+    uint64 samples;
+    uint64 rows;
+    uint64 instructions;
+    uint64 misses;
+    uint64 cpuNs;
+};
+
+struct AggCacheObservation {
+    uint64 windowStart;
+    uint64 rows;
+    uint64 updateNs;
+    AggCacheUpdateStats pmu;
+};
+
+void AggCacheFlushObservation(AggCacheObservation& observation, int node, uint32 stream, int llc)
+{
+    if (observation.windowStart == 0)
+        return;
+    ereport(LOG, (errmsg("agg_update_observation node=%d stream=%u worker=%d llc=%d window_ns=%lu "
+        "rows=%lu update_ns=%lu sample_rows=%lu instructions=%lu misses=%lu sample_cpu_ns=%lu",
+        node, stream, (int)u_sess->stream_cxt.smp_id, llc, observation.windowStart,
+        observation.rows, observation.updateNs, observation.pmu.rows, observation.pmu.instructions,
+        observation.pmu.misses, observation.pmu.cpuNs), errhidestmt(true), ErrOutToClient(false)));
+    observation = AggCacheObservation{};
+}
+
+const StreamAggCacheRange* AggCacheLocalRange(const StreamAggCacheDemand* demand, int llc)
+{
+    if (demand == NULL || demand->localRanges == NULL || demand->localRanges[llc].count == 0)
+        return NULL;
+    return &demand->localRanges[llc];
+}
+
+int AggCacheDemandScore(const StreamAggCacheDemand* demand, const StreamAggCacheRange* range)
+{
+    if (demand == NULL)
+        return 0;
+    int needingInput = 0;
+    int blocked = 0;
+    int first = range == NULL ? 0 : range->first;
+    int receivers = range == NULL ? demand->receivers : range->count;
+    int producers = range == NULL ? demand->producers : range->count;
+    for (int i = first; i < first + receivers; ++i)
+        needingInput += __atomic_load_n(&demand->receiverWaiting[i], __ATOMIC_RELAXED);
+    for (int i = first; i < first + producers; ++i)
+        blocked += __atomic_load_n(&demand->producerWaiting[i], __ATOMIC_RELAXED);
+    return 1000 * needingInput / receivers - 1000 * blocked / producers;
+}
+
+bool EnterAggCacheUpdate(AggCacheDomain& domain, int llc, int member, uint32 slots, bool windowed, bool borrow,
+    StreamAggCacheDemand* demand, uint64 stateBytes, uint64 cacheBytes, bool critical, AggCacheWaitStats& stats)
+{
+    const uint64 query = u_sess->debug_query_id;
+    if (query == 0)
+        return false;
+    const uint64 begin = AggCacheNow();
+    const int peer = 1 - member;
+    uint64 now = begin;
+    bool countedIdleWait = false;
+    bool countedPriorityWait = false;
+    for (;;) {
+        uint32 unlocked = 0;
+        if (__atomic_compare_exchange_n(&domain.locked, &unlocked, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            uint32 running = __atomic_load_n(&domain.active, __ATOMIC_ACQUIRE);
+            if (domain.query != query) {
+                if (running != 0) {
+                    __atomic_store_n(&domain.locked, 0, __ATOMIC_RELEASE);
+                    ++stats.bypassed;
+                    return false;
+                }
+                domain.query = query;
+                domain.lastSeen[0] = domain.lastSeen[1] = 0;
+                domain.lastDenied[0] = domain.lastDenied[1] = 0;
+                domain.stateBytes[0] = domain.stateBytes[1] = 0;
+                __atomic_store_n(&domain.activeByMember[0], 0, __ATOMIC_RELAXED);
+                __atomic_store_n(&domain.activeByMember[1], 0, __ATOMIC_RELAXED);
+                domain.demand[0] = domain.demand[1] = NULL;
+                domain.windowEnd = 0;
+                domain.preferred = critical ? -1 : peer;
+                domain.previousCandidate = -1;
+            }
+            now = AggCacheNow();
+            domain.lastSeen[member] = now;
+            bool peerActive = now - domain.lastSeen[peer] <= aggCacheWindowNs;
+            uint32 memberRunning = 0;
+            if (cacheBytes != 0) {
+                memberRunning = __atomic_load_n(&domain.activeByMember[member], __ATOMIC_RELAXED);
+                uint32 peerRunning = __atomic_load_n(&domain.activeByMember[peer], __ATOMIC_RELAXED);
+                domain.stateBytes[member] = Max(domain.stateBytes[member], Min(stateBytes, cacheBytes));
+                /* Count active workers only. The largest observed state per branch is
+                 * a conservative proxy for its footprint, with LLC headroom for peers. */
+                uint64 estimatedBytes = stateBytes + memberRunning * domain.stateBytes[member] +
+                    peerRunning * domain.stateBytes[peer];
+                peerActive = peerRunning != 0 && estimatedBytes > cacheBytes - cacheBytes / 4;
+            }
+            bool available = running < slots;
+            if (windowed) {
+                domain.demand[member] = demand;
+                if (peerActive && now >= domain.windowEnd) {
+                    const StreamAggCacheRange* range0 = AggCacheLocalRange(domain.demand[0], llc);
+                    const StreamAggCacheRange* range1 = AggCacheLocalRange(domain.demand[1], llc);
+                    bool local = range0 != NULL && range1 != NULL && range0->ordinal == range1->ordinal;
+                    int score0 = AggCacheDemandScore(domain.demand[0], local ? range0 : NULL);
+                    int score1 = AggCacheDemandScore(domain.demand[1], local ? range1 : NULL);
+                    int difference = score0 - score1;
+                    if (local)
+                        ++stats.localWindows;
+                    if (critical) {
+                        int candidate = -1;
+                        // A score of 250 is a 25 percentage-point net wait imbalance.
+                        if (local && abs(difference) >= 250 && Max(score0, score1) >= 250)
+                            candidate = difference > 0 ? 0 : 1;
+                        bool consecutive = domain.windowEnd != 0 && now - domain.windowEnd < aggCacheWindowNs;
+                        domain.preferred = consecutive && candidate == domain.previousCandidate ? candidate : -1;
+                        domain.previousCandidate = candidate;
+                        if (domain.preferred >= 0)
+                            ++stats.priorityWindows;
+                    } else if (domain.demand[0] != NULL && domain.demand[1] != NULL && abs(difference) >= 100) {
+                        domain.preferred = difference > 0 ? 0 : 1;
+                        ++stats.demandWindows;
+                    } else if (local) {
+                        /* Adjacent LLC domains favor opposite branches in the same epoch. */
+                        domain.preferred = (now / aggCacheWindowNs + range0->ordinal) % 2;
+                        ++stats.staggeredWindows;
+                    } else {
+                        domain.preferred = 1 - domain.preferred;
+                    }
+                    domain.windowEnd = local ? now - now % aggCacheWindowNs + aggCacheWindowNs :
+                        now + aggCacheWindowNs;
+                    ++stats.windows;
+                }
+                if (critical) {
+                    available = available || domain.preferred < 0 || member == domain.preferred;
+                    if (peerActive && !available && !countedPriorityWait) {
+                        ++stats.priorityWaits;
+                        countedPriorityWait = true;
+                    }
+                } else if (peerActive && slots > 1) {
+                    uint32 reserve = Max(1U, slots / 4);
+                    bool preferred = member == domain.preferred;
+                    uint32 budget = preferred ? slots - reserve : reserve;
+                    uint32 active = cacheBytes != 0 ? memberRunning :
+                        __atomic_load_n(&domain.activeByMember[member], __ATOMIC_RELAXED);
+                    bool peerWaiting = cacheBytes == 0 ||
+                        (domain.lastDenied[peer] != 0 && now - domain.lastDenied[peer] <= aggCacheWaitingNs);
+                    if (available && active >= budget && !peerWaiting)
+                        ++stats.usedSpareSlots;
+                    if (available && active >= budget && peerWaiting) {
+                        /* Renew borrowing only after the preferred branch stops asking.
+                         * Existing loans expire when their update batch ends. */
+                        available = borrow && !preferred && now - domain.lastSeen[1 - member] >= 100000 &&
+                            __atomic_load_n(&domain.activeByMember[1 - member], __ATOMIC_RELAXED) < slots - reserve;
+                        if (available)
+                            ++stats.borrowed;
+                        else if (!countedIdleWait) {
+                            ++stats.idleSlotWaits;
+                            countedIdleWait = true;
+                        }
+                    }
+                }
+            }
+            bool blocked = peerActive && !available;
+            if (cacheBytes != 0 && blocked)
+                domain.lastDenied[member] = now;
+            /* A timed-out update still occupies LLC capacity. If we can
+             * acquire the domain lock, track it until the batch completes. */
+            bool trackedBypass = cacheBytes != 0 && blocked && now - begin >= 250000;
+            if (!blocked || trackedBypass) {
+                if (windowed)
+                    __atomic_fetch_add(&domain.activeByMember[member], 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&domain.active, 1, __ATOMIC_RELAXED);
+                __atomic_store_n(&domain.locked, 0, __ATOMIC_RELEASE);
+                if (cacheBytes != 0 && !peerActive)
+                    ++stats.admittedWithoutPressure;
+                if (trackedBypass)
+                    ++stats.bypassed;
+                else
+                    ++stats.admitted;
+                if (now - begin >= 20000) {
+                    ++stats.waited;
+                    stats.waitNs += now - begin;
+                }
+                return true;
+            }
+            __atomic_store_n(&domain.locked, 0, __ATOMIC_RELEASE);
+        }
+        now = AggCacheNow();
+        if (now - begin >= 250000) {
+            ++stats.bypassed;
+            ++stats.waited;
+            stats.waitNs += now - begin;
+            return false;
+        }
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(20);
+    }
+}
+
+void LeaveAggCacheUpdate(AggCacheDomain& domain, int member, bool windowed)
+{
+    if (windowed)
+        __atomic_fetch_sub(&domain.activeByMember[member], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&domain.active, 1, __ATOMIC_RELEASE);
+}
+}
+#endif
 /*
  * @Description	: Check if current aggref's expression is supported or not.
  * @in node		: Aggref's expression node.
@@ -381,7 +655,9 @@ bool isSonicHashAggEnable(VecAgg* node)
  * @in arrSize		: The array size of sonic atom data arry.
  * @out			: SonicHashAgg infomation.
  */
-SonicHashAgg::SonicHashAgg(VecAggState* runtime, int arrSize) : SonicHash(arrSize), m_runtime(runtime)
+SonicHashAgg::SonicHashAgg(VecAggState* runtime, int arrSize, SonicHashSource* partitionInput,
+    uint64 partitionBudget, uint64 partitionRows, bool directWorker)
+    : SonicHash(arrSize), m_runtime(runtime), m_partitionInput(partitionInput), m_directWorker(directWorker)
 {
     m_rows = 0;
     m_keySimple = true;
@@ -411,44 +687,53 @@ SonicHashAgg::SonicHashAgg(VecAggState* runtime, int arrSize) : SonicHash(arrSiz
 
     /* initialize memcontrol */
     initMemoryControl();
+    if (m_partitionInput != NULL) {
+        m_memControl.totalMem = partitionBudget;
+        /* A spilled shard can reuse its resident-state budget. */
+        m_memControl.maxMem = 0;
+    }
 
-    m_memControl.hashContext = AllocSetContextCreate(CurrentMemoryContext,
-        "SonicHashAggContext",
-        ALLOCSET_DEFAULT_MINSIZE,
-        ALLOCSET_DEFAULT_INITSIZE,
-        ALLOCSET_DEFAULT_MAXSIZE,
-        EnableBorrowWorkMemory() ? RACK_CONTEXT : STANDARD_CONTEXT,
-        m_memControl.totalMem);
+    if (!m_directWorker) {
+        m_memControl.hashContext = AllocSetContextCreate(CurrentMemoryContext,
+            "SonicHashAggContext",
+            ALLOCSET_DEFAULT_MINSIZE,
+            ALLOCSET_DEFAULT_INITSIZE,
+            ALLOCSET_DEFAULT_MAXSIZE,
+            EnableBorrowWorkMemory() ? RACK_CONTEXT : STANDARD_CONTEXT,
+            m_memControl.totalMem);
 
-    AddControlMemoryContext(runtime->ss.ps.instrument, m_memControl.hashContext);
+        if (m_partitionInput == NULL)
+            AddControlMemoryContext(runtime->ss.ps.instrument, m_memControl.hashContext);
 
-    {
-        AutoContextSwitch memSwitch(m_memControl.hashContext);
+        {
+            AutoContextSwitch memSwitch(m_memControl.hashContext);
 
-        /* initialize sonic datum array to store table(batch) */
-        initDataArray();
+            /* initialize sonic datum array to store table(batch) */
+            initDataArray();
 
-        /* compute hash table size that needed */
-        m_hashSize = Min(2 * node->numGroups, (long)(m_memControl.totalMem / m_arrayElementSize));
-        m_hashSize = calcHashTableSize<false, true>(m_hashSize);
+            /* compute hash table size that needed */
+            long groups = m_partitionInput == NULL ? node->numGroups : (long)Min(partitionRows, 65536UL);
+            m_hashSize = Min(2 * groups, (long)(m_memControl.totalMem / m_arrayElementSize));
+            m_hashSize = calcHashTableSize<false, true>(m_hashSize);
 
-        /* initialize sonic hash table */
-        initHashTable();
+            /* initialize sonic hash table */
+            initHashTable();
 
-        /* report initial memory needed by sonic hashagg */
-        int64 initNeedSize = 0;
-        int64 initFreeSize = 0;
-        calcHashContextSize(m_memControl.hashContext, &initNeedSize, &initFreeSize);
+            /* report initial memory needed by sonic hashagg */
+            int64 initNeedSize = 0;
+            int64 initFreeSize = 0;
+            calcHashContextSize(m_memControl.hashContext, &initNeedSize, &initFreeSize);
 
-        /* for initialize state, we only check memory free space for DN */
-        if (IS_PGXC_DATANODE && (uint64)initNeedSize > m_memControl.totalMem)
-            ereport(WARNING,
-                (errmodule(MOD_VEC_EXECUTOR),
-                    errmsg("[VecSonicHashAgg(%d)]:"
-                           "The minimum memory needed is %ld, but only have %lu.",
-                        m_runtime->ss.ps.plan->plan_node_id,
-                        initNeedSize,
-                        m_memControl.totalMem)));
+            /* for initialize state, we only check memory free space for DN */
+            if (IS_PGXC_DATANODE && (uint64)initNeedSize > m_memControl.totalMem)
+                ereport(WARNING,
+                    (errmodule(MOD_VEC_EXECUTOR),
+                        errmsg("[VecSonicHashAgg(%d)]:"
+                               "The minimum memory needed is %ld, but only have %lu.",
+                            m_runtime->ss.ps.plan->plan_node_id,
+                            initNeedSize,
+                            m_memControl.totalMem)));
+        }
     }
 
     /*
@@ -464,8 +749,9 @@ SonicHashAgg::SonicHashAgg(VecAggState* runtime, int arrSize) : SonicHash(arrSiz
     /* initialize hash match function */
     initMatchFunc(m_buildOp.tupleDesc, m_buildOp.keyIndx, m_buildOp.keyNum);
 
-    /* binding build function */
-    BindingFp();
+    /* Binding for a shared worker happens when a shard is attached. */
+    if (!m_directWorker)
+        BindingFp();
 
     if (m_runtime->ss.ps.instrument) {
         m_runtime->ss.ps.instrument->sorthashinfo.hashtable_expand_times = 0;
@@ -477,6 +763,84 @@ SonicHashAgg::SonicHashAgg(VecAggState* runtime, int arrSize) : SonicHash(arrSiz
     } else {
         m_buildScanBatch = &SonicHashAgg::BuildScanBatchSimple;
     }
+}
+
+void SonicHashAgg::HashSharedInput(VectorBatch* batch, uint32* hashes)
+{
+    hashBatchArray(batch, (void*)m_buildOp.hashFunc, m_buildOp.hashFmgr, m_buildOp.keyIndx, hashes);
+}
+
+void SonicHashAgg::InitSharedTable(SonicAggSharedTable& table, MemoryContext parent, uint64 budget, uint64 groups)
+{
+    m_memControl.hashContext = AllocSetContextCreate(parent, "SonicAggregateShard",
+        ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE, SHARED_CONTEXT);
+    m_memControl.totalMem = budget;
+    m_memControl.maxMem = 0;
+    m_rows = 0;
+    m_strategy = HASH_IN_MEMORY;
+    m_arrayElementSize = 0;
+    m_arrayExpandSize = 0;
+    m_segNum = 0;
+    m_segBucket = NULL;
+    m_bucket = NULL;
+    initDataArray();
+    m_hashSize = Min((int64)(2 * groups), (int64)(budget / m_arrayElementSize));
+    m_hashSize = calcHashTableSize<false, false>(m_hashSize);
+    initHashTable();
+    SaveSharedTable(table);
+}
+
+void SonicHashAgg::AttachSharedTable(const SonicAggSharedTable& table, uint64 budget)
+{
+    m_memControl.hashContext = table.context;
+    m_memControl.totalMem = budget;
+    m_memControl.maxMem = 0;
+    m_data = table.data;
+    m_hash = table.hashes;
+    m_next = table.next;
+    m_segBucket = table.segments;
+    m_bucket = table.buckets;
+    m_rows = table.rows;
+    m_hashSize = table.hashSize;
+    m_arrayExpandSize = table.expandBytes;
+    m_arrayElementSize = table.elementBytes;
+    m_segNum = table.segmentCount;
+    m_useSegHashTbl = table.segmented;
+    m_enableExpansion = table.expandable;
+    m_strategy = table.spilling ? HASH_IN_DISK : HASH_IN_MEMORY;
+    m_stateLog.restore = false;
+    m_tupleCount = 0;
+    m_colWidth = 0;
+    BindingFp();
+}
+
+void SonicHashAgg::SaveSharedTable(SonicAggSharedTable& table)
+{
+    table.context = m_memControl.hashContext;
+    table.data = m_data;
+    table.hashes = m_hash;
+    table.next = m_next;
+    table.segments = m_segBucket;
+    table.buckets = m_bucket;
+    table.rows = m_rows;
+    table.hashSize = m_hashSize;
+    table.expandBytes = m_arrayExpandSize;
+    table.elementBytes = m_arrayElementSize;
+    table.segmentCount = m_segNum;
+    table.segmented = m_useSegHashTbl;
+    table.expandable = m_enableExpansion;
+    table.spilling = m_strategy == HASH_IN_DISK;
+}
+
+int SonicHashAgg::UpdateSharedTable(SonicAggSharedTable& table, VectorBatch* batch, uint32* hashes, uint16* spillRows)
+{
+    m_directHashes = hashes;
+    m_directSpillRows = spillRows;
+    m_directSpillCount = 0;
+    tryExpandHashTable();
+    (this->*m_buildFun)(batch);
+    SaveSharedTable(table);
+    return m_directSpillCount;
 }
 
 /*
@@ -748,7 +1112,7 @@ void SonicHashAgg::initDataArray()
         m_arrayExpandSize += (m_data[count]->m_atomTypeSize * (int64)m_atomSize + m_atomSize);
 
         /* Initialize data array for count column */
-        if (count == m_finalAggInfo[i].idx) {
+        if (i >= 0 && count == m_finalAggInfo[i].idx) {
             attr->atttypid = INT8OID;
             getDataDesc(&desc, 0, attr, false);
             m_data[count + 1] = New(m_memControl.hashContext)
@@ -835,7 +1199,7 @@ void SonicHashAgg::initSimpleMatchFuncByType(const int typesize, const int index
 /*
  * @Description	: Initialize hash match function for datum array and value.
  * @in desc		: Tuple descriptor used to describe data type info.
- * @in keyIdx		: The serial number of hash key in m_data.
+ * @in keyIdx		: The input column number of each hash key.
  * @in keyNum	: Number of hash keys.
  */
 void SonicHashAgg::initMatchFunc(TupleDesc desc, uint16* keyIdx, uint16 keyNum)
@@ -844,8 +1208,9 @@ void SonicHashAgg::initMatchFunc(TupleDesc desc, uint16* keyIdx, uint16 keyNum)
     m_valueKeyMatch = (pKeyMatchValueFunc*)palloc0(sizeof(pKeyMatchValueFunc) * keyNum);
 
     for (int i = 0; i < keyNum; i++) {
-        if (integerType(m_data[m_keyIdxInSonic[i]]->m_desc.typeId)) {
-            initSimpleMatchFuncByType(m_data[m_keyIdxInSonic[i]]->m_desc.typeSize, i);
+        Form_pg_attribute key = TupleDescAttr(desc, keyIdx[i]);
+        if (integerType(key->atttypid)) {
+            initSimpleMatchFuncByType(key->attlen, i);
         } else {
             m_arrayKeyMatch[i] = &SonicHashAgg::matchArray<false>;
             m_valueKeyMatch[i] = &SonicHashAgg::matchValue<false>;
@@ -967,7 +1332,18 @@ VectorBatch* SonicHashAgg::Run()
 
             /* Get data and insert into hash table */
             case AGG_BUILD: {
+                instr_time start;
+                if (m_partitionInput != NULL)
+                    INSTR_TIME_SET_CURRENT(start);
                 Build();
+                if (m_partitionInput != NULL) {
+                    instr_time finish;
+                    INSTR_TIME_SET_CURRENT(finish);
+                    INSTR_TIME_SUBTRACT(finish, start);
+                    m_partitionBuildNs += (uint64)(INSTR_TIME_GET_MICROSEC(finish) * 1000);
+                    m_partitionPeak = Max(m_partitionPeak, GetPartitionBytes());
+                    m_partitionGroups += m_rows;
+                }
 
                 /* print the hash table information when needed */
                 bool can_wlm_warning_stats = false;
@@ -1001,7 +1377,7 @@ VectorBatch* SonicHashAgg::Run()
                     }
                 }
 
-                if (!m_memControl.spillToDisk) {
+                if (!m_memControl.spillToDisk && m_partitionInput == NULL) {
                     /* Early free left tree after hash table built */
                     ExecEarlyFree(outerPlanState(m_runtime));
 
@@ -1051,6 +1427,99 @@ VectorBatch* SonicHashAgg::Run()
 void SonicHashAgg::Build()
 {
     VectorBatch* outer_batch = NULL;
+#ifdef ENABLE_HTAP
+    bool measurePrivate = u_sess->attr.attr_sql.enable_imcs_shared_sonic_agg_stats &&
+        m_partitionInput == NULL && m_runtime->ss.ps.plan->dop > 1;
+    uint64 privateStart = measurePrivate ? AggCacheNow() : 0;
+    uint64 privateCpuStart = measurePrivate ? AggCacheNow(CLOCK_THREAD_CPUTIME_ID) : 0;
+    uint64 privateInputRows = 0;
+    int slots = u_sess->attr.attr_sql.imcs_agg_cache_slots;
+    int node = m_runtime->ss.ps.plan->plan_node_id;
+    bool tracing = u_sess->attr.attr_sql.enable_cache_trace;
+    bool windowed = u_sess->attr.attr_sql.enable_imcs_agg_cache_window;
+    StreamSharedContext* stream = NULL;
+    if ((windowed || tracing) && u_sess->stream_cxt.producer_obj != NULL)
+        stream = u_sess->stream_cxt.producer_obj->getSharedContext();
+    StreamAggCacheDemand* demand = stream == NULL ? NULL : stream->aggCacheDemand;
+    bool observe = tracing && demand != NULL && demand->sendObservation != NULL;
+    int cacheMember = (slots > 0 || observe) && u_sess->attr.attr_sql.enable_imcs_nps &&
+        !u_sess->attr.attr_sql.enable_imcs_adapt ? AggCacheTarget(node) : -1;
+    uint64 cacheBytes = 0;
+    bool livePressure = windowed && u_sess->attr.attr_sql.enable_imcs_agg_cache_live_pressure;
+    bool critical = windowed && u_sess->attr.attr_sql.enable_imcs_agg_cache_critical &&
+        u_sess->attr.attr_sql.enable_imcs_agg_cache_chiplet;
+    int domain = cacheMember >= 0 ? RhjLlcDomain(sched_getcpu(), (livePressure || critical) ? &cacheBytes : NULL) : -1;
+    bool validDomain = domain >= 0 && domain < CPU_SETSIZE;
+    AggCacheDomain* cacheDomain = validDomain && slots > 0 ? &aggCacheDomains[domain] : NULL;
+    observe = observe && validDomain;
+    bool borrow = windowed && u_sess->attr.attr_sql.enable_imcs_agg_cache_borrow;
+    AggCacheWaitStats cacheStats = {};
+    AggCacheUpdateStats updateStats = {};
+    AggCacheObservation observation = {};
+    bool profile = tracing && (cacheDomain != NULL || observe);
+    bool harmful = VecCacheCoordHarmfulEnabled();
+    unsigned sampleOffset = (unsigned)u_sess->stream_cxt.smp_id & 31;
+    int tileBudgetDomain = ChipletCacheObserveAggregates() && m_partitionInput == NULL ?
+        RhjLlcDomain(sched_getcpu()) : -1;
+    unsigned tileBudgetBatches = sampleOffset;
+    auto update = [&](VectorBatch* batch, bool eligible) {
+        uint64 updateStart = 0;
+        if (observe) {
+            updateStart = AggCacheNow();
+            uint64 window = updateStart - updateStart % STREAM_AGG_OBSERVATION_NS;
+            if (window != observation.windowStart) {
+                AggCacheFlushObservation(observation, node, stream->key_s.planNodeId, domain);
+                observation.windowStart = window;
+                updateStart = AggCacheNow();
+            }
+            observation.rows += batch->m_rows;
+        }
+        VecCacheTraceCounters before;
+        bool sampled = profile && eligible && (++updateStats.candidates & 31) == sampleOffset &&
+            VecCacheTraceSnapshot(&before);
+        int sampledRows = sampled ? batch->m_rows : 0;
+        uint64 cpuStart = sampled ? AggCacheNow(CLOCK_THREAD_CPUTIME_ID) : 0;
+        auto updateState = [&] {
+            if (unlikely(harmful && m_strategy == HASH_IN_MEMORY && (uint64)m_rows * m_arrayElementSize >= 512 * 1024)) {
+                VecCacheCoordRunHarmfulPhase(HarmfulCachePhase::Aggregate, [&] { (this->*m_buildFun)(batch); });
+            } else {
+                (this->*m_buildFun)(batch);
+            }
+        };
+        uint64* overlap = u_sess->attr.attr_sql.imcs_rhj_overlap_peer_kind == (int)RhjOverlapPeerKind::Aggregate ?
+            VecCacheCoordOverlapPeerStage(node, RhjOverlapPeerKind::Aggregate) : NULL;
+        if (unlikely(overlap != NULL)) {
+            VecCacheCoordRunPeerStage(overlap, updateState);
+        } else {
+            updateState();
+        }
+        if (sampled) {
+            uint64 cpuNs = AggCacheNow(CLOCK_THREAD_CPUTIME_ID) - cpuStart;
+            VecCacheTraceCounters after;
+            if (VecCacheTraceSnapshot(&after) && after.instructions > before.instructions &&
+                after.misses >= before.misses && after.runningNs > before.runningNs &&
+                after.enabledNs > before.enabledNs) {
+                uint64 running = after.runningNs - before.runningNs;
+                uint64 enabled = after.enabledNs - before.enabledNs;
+                if (running <= enabled && (double)running >= 0.95 * enabled) {
+                    ++updateStats.samples;
+                    updateStats.rows += sampledRows;
+                    updateStats.instructions += after.instructions - before.instructions;
+                    updateStats.misses += after.misses - before.misses;
+                    updateStats.cpuNs += cpuNs;
+                    if (observe) {
+                        observation.pmu.rows += sampledRows;
+                        observation.pmu.instructions += after.instructions - before.instructions;
+                        observation.pmu.misses += after.misses - before.misses;
+                        observation.pmu.cpuNs += cpuNs;
+                    }
+                }
+            }
+        }
+        if (observe)
+            observation.updateNs += AggCacheNow() - updateStart;
+    };
+#endif
 
     /* load data, build hash table & calculate agg function */
     WaitState oldStatus = pgstat_report_waitstatus(STATE_EXEC_HASHAGG_BUILD_HASH);
@@ -1063,9 +1532,72 @@ void SonicHashAgg::Build()
         /* first try to expand hash table if needed */
         tryExpandHashTable();
 
-        (this->*m_buildFun)(outer_batch);
+#ifdef ENABLE_HTAP
+        if (measurePrivate)
+            privateInputRows += outer_batch->m_rows;
+        if (tileBudgetDomain >= 0 && m_strategy == HASH_IN_MEMORY && (++tileBudgetBatches & 31) == 0) {
+            uint64 bytes = EstimateRecentStateBytes(m_rows, 4 * (uint64)outer_batch->m_rows);
+            ChipletCachePublishAggregate(tileBudgetDomain, node, u_sess->stream_cxt.smp_id, bytes);
+        }
+        uint64 stateBytes = (uint64)m_rows * m_arrayElementSize;
+        bool eligible = (cacheDomain != NULL || observe) && m_strategy == HASH_IN_MEMORY && stateBytes >= 512 * 1024;
+        if (cacheDomain != NULL && eligible &&
+            EnterAggCacheUpdate(*cacheDomain, domain, cacheMember, (uint32)slots, windowed, borrow,
+                demand, stateBytes, cacheBytes, critical, cacheStats)) {
+            /* A slot covers state updates only, never a child call or Stream send. */
+            PG_TRY();
+            {
+                update(outer_batch, true);
+            }
+            PG_CATCH();
+            {
+                LeaveAggCacheUpdate(*cacheDomain, cacheMember, windowed);
+                PG_RE_THROW();
+            }
+            PG_END_TRY();
+            LeaveAggCacheUpdate(*cacheDomain, cacheMember, windowed);
+        } else {
+            update(outer_batch, eligible);
+        }
+#else
+        {
+            (this->*m_buildFun)(outer_batch);
+        }
+#endif
     }
     (void)pgstat_report_waitstatus(oldStatus);
+#ifdef ENABLE_HTAP
+    if (measurePrivate) {
+        ereport(LOG, (errmsg("sonic_private_agg query_id=%lu node=%d lane=%d llc=%d input_rows=%lu "
+            "groups=%ld state_bytes=%lu spill=%d build_ns=%lu cpu_ns=%lu",
+            u_sess->debug_query_id, node, (int)u_sess->stream_cxt.smp_id, RhjLlcDomain(sched_getcpu()),
+            privateInputRows, m_rows, GetPartitionBytes(), (int)m_memControl.spillToDisk,
+            AggCacheNow() - privateStart, AggCacheNow(CLOCK_THREAD_CPUTIME_ID) - privateCpuStart),
+            errhidestmt(true), ErrOutToClient(false)));
+    }
+    if (cacheDomain != NULL) {
+        ereport(LOG, (errmsg("agg_cache_coord node=%d worker=%d llc=%d slots=%d admitted=%lu waited=%lu "
+            "wait_ns=%lu bypassed=%lu windowed=%d demand_stream=%d windows=%lu demand_windows=%lu "
+            "borrowed=%lu idle_slot_waits=%lu local_windows=%lu staggered_windows=%lu "
+            "admitted_without_pressure=%lu used_spare_slots=%lu priority_windows=%lu priority_waits=%lu",
+            node, (int)u_sess->stream_cxt.smp_id, domain, slots,
+            cacheStats.admitted, cacheStats.waited, cacheStats.waitNs, cacheStats.bypassed, (int)windowed,
+            demand != NULL ? 1 : 0, cacheStats.windows, cacheStats.demandWindows,
+            cacheStats.borrowed, cacheStats.idleSlotWaits, cacheStats.localWindows, cacheStats.staggeredWindows,
+            cacheStats.admittedWithoutPressure, cacheStats.usedSpareSlots, cacheStats.priorityWindows,
+            cacheStats.priorityWaits),
+            errhidestmt(true), ErrOutToClient(false)));
+    }
+    if (observe)
+        AggCacheFlushObservation(observation, node, stream->key_s.planNodeId, domain);
+    if (profile) {
+            ereport(LOG, (errmsg("agg_cache_update node=%d worker=%d llc=%d borrow=%d candidates=%lu samples=%lu "
+                "sample_rows=%lu instructions=%lu misses=%lu cpu_ns=%lu",
+                node, (int)u_sess->stream_cxt.smp_id, domain, (int)borrow, updateStats.candidates, updateStats.samples,
+                updateStats.rows, updateStats.instructions, updateStats.misses, updateStats.cpuNs),
+                errhidestmt(true), ErrOutToClient(false)));
+    }
+#endif
 
     /* record state of sonic hashagg */
     if (HAS_INSTR(&m_runtime->ss, false)) {
@@ -1135,7 +1667,8 @@ SonicHashSource* SonicHashAgg::GetHashSource()
 
     switch (m_strategy) {
         case HASH_IN_MEMORY: {
-            ps = New(CurrentMemoryContext) SonicHashOpSource(outerPlanState(m_runtime));
+            ps = m_partitionInput == NULL ? New(CurrentMemoryContext) SonicHashOpSource(outerPlanState(m_runtime))
+                                         : m_partitionInput;
             break;
         }
 
@@ -1430,8 +1963,12 @@ void SonicHashAgg::buildAggTblBatch(VectorBatch* batch)
 #endif
 
     /* 1. calculate hash value. */
-    hashBatchArray(batch, (void*)m_buildOp.hashFunc, m_buildOp.hashFmgr, m_buildOp.keyIndx, m_hashVal);
-    hash_val = m_hashVal;
+    if (m_directWorker) {
+        hash_val = m_directHashes;
+    } else {
+        hashBatchArray(batch, (void*)m_buildOp.hashFunc, m_buildOp.hashFmgr, m_buildOp.keyIndx, m_hashVal);
+        hash_val = m_hashVal;
+    }
 
     m_missNum = 0;
     m_suspectNum = 0;
@@ -1667,6 +2204,30 @@ int64 SonicHashAgg::insertHashTbl(VectorBatch* batch, int idx, uint32 hashval, u
  * @in freeSize	: free space in current cxt.
  * @return		: void.
  */
+uint64 SonicHashAgg::GetPartitionBytes()
+{
+    int64 bytes = 0;
+    int64 freeBytes = 0;
+    calcHashContextSize(m_memControl.hashContext, &bytes, &freeBytes);
+    return bytes;
+}
+
+void SonicHashAgg::ClosePartitionFiles()
+{
+    if (m_partFileSource != NULL) {
+        for (int i = 0; i < m_partNum; ++i) {
+            if (m_partFileSource[i] != NULL)
+                m_partFileSource[i]->freeResources();
+        }
+    }
+    if (m_overflowFileSource != NULL) {
+        for (int i = 0; i < m_overflowNum; ++i) {
+            if (m_overflowFileSource[i] != NULL)
+                m_overflowFileSource[i]->freeResources();
+        }
+    }
+}
+
 void SonicHashAgg::calcHashContextSize(MemoryContext ctx, int64* memorySize, int64* freeSize)
 {
     AllocSetContext* aset = (AllocSetContext*)ctx;
@@ -1946,17 +2507,31 @@ void SonicHashAgg::AllocHashTbl(VectorBatch* batch, int idx, uint32 hashval, int
 
             int64 size_needed = insertHashTbl(batch, idx, hashval, hashLoc);
 
-            /* judge memory status after inserting */
-            judgeMemoryOverflow("VecSonicHashAgg",
-                m_runtime->ss.ps.plan->plan_node_id,
-                SET_DOP(m_runtime->ss.ps.plan->dop),
-                m_runtime->ss.ps.instrument,
-                size_needed);
+            if (m_directWorker) {
+                uint64 allocated = ((AllocSetContext*)m_memControl.hashContext)->totalSpace;
+                bool needsAtom = (m_rows & (m_atomSize - 1)) == m_atomSize - 1;
+                if (allocated >= m_memControl.totalMem ||
+                    (needsAtom && allocated + m_arrayExpandSize >= m_memControl.totalMem)) {
+                    m_strategy = HASH_IN_DISK;
+                    m_enableExpansion = false;
+                }
+            } else {
+                judgeMemoryOverflow("VecSonicHashAgg",
+                    m_runtime->ss.ps.plan->plan_node_id,
+                    SET_DOP(m_runtime->ss.ps.plan->dop),
+                    m_runtime->ss.ps.instrument,
+                    size_needed);
+            }
         } break;
 
         case HASH_IN_DISK: {
-            /* spill to disk first time */
             m_loc[idx] = 0;
+            /* Only unmatched keys spill. A worker writes its own file after releasing the shard. */
+            if (m_directWorker) {
+                m_directSpillRows[m_directSpillCount++] = idx;
+                break;
+            }
+            /* spill to disk first time */
             WaitState oldState = pgstat_report_waitstatus(STATE_EXEC_HASHAGG_WRITE_FILE);
             if (unlikely(false == m_memControl.spillToDisk)) {
                 m_partNum = calcPartitionNum(((VecAgg*)m_runtime->ss.ps.plan)->numGroups);

@@ -5495,7 +5495,7 @@ static void show_vechash_info(VecHashJoinState* hashstate, ExplainState* es)
                     es->planinfo->m_staticInfo->set_plan_name<false, true>();
                     appendStringInfo(es->planinfo->m_staticInfo->info_str, "%s ", node_name);
 
-                    if (((HashJoin*)planstate->plan)->isSonicHash) {
+                    if (((VecHashJoinState*)planstate)->hashExecutorKind != VEC_HASH_JOIN_STANDARD) {
                         show_datanode_sonicjoin_info(
                             es, es->planinfo->m_staticInfo->info_str, partNum, spillNum, spaceUsed, is_writefile);
                         if (is_writefile) {
@@ -5537,7 +5537,7 @@ static void show_vechash_info(VecHashJoinState* hashstate, ExplainState* es)
                         probe_time * 1000.0);
                 } else {
                     append_datanode_name(es, node_name, 1, 0);
-                    if (((HashJoin*)planstate->plan)->isSonicHash) {
+                    if (((VecHashJoinState*)planstate)->hashExecutorKind != VEC_HASH_JOIN_STANDARD) {
                         show_datanode_sonicjoin_info(es, es->str, partNum, spillNum, spaceUsed, is_writefile);
                         if (is_writefile) {
                             append_datanode_name(es, node_name, 1, 0);

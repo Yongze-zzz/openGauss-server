@@ -257,11 +257,53 @@ const char* sync_guc_variable_namelist[] = {"work_mem",
     "query_mem",
     // GUC variable for [chiplet-unaware imcs]/[chiplet-aware]/[cpu & mem-map for scalability experiment control],
 #ifdef ENABLE_HTAP
+    "enable_imcs_nps",
+    "enable_imcs_stream_hotspot_split",
+    "enable_imcs_stream_batch_ring",
+    "radix_shared_preselect_builders",
+    "imcs_stream_batch_ring_extra_slots",
+    "enable_imcs_stream_consumer_placement",
+    "enable_imcs_stream_hotflow_colocation",
+    "enable_imcs_stream_path_rebalance",
+    "enable_imcs_adapt",
+    "enable_imcs_adapt_migration",
+    "enable_imcs_local_task_queue",
+    "enable_imcs_nps_cu_balance",
+    "enable_imcs_shared_sonic_agg",
+    "enable_imcs_shared_sonic_agg_stats",
+    "enable_cache_trace",
+    "enable_imcs_cache_coord",
+    "enable_imcs_cache_coord_llc_pressure",
+    "enable_imcs_cache_harmful",
+    "enable_imcs_cache_harmful_defer",
+    "enable_radix_shared_probe_locality",
+    "enable_radix_shared_probe_count",
+    "enable_imcs_rhj_overlap_prefetch",
+    "enable_imcs_rhj_overlap_match_yield",
+    "enable_imcs_cache_probe_coord",
+    "cache_trace_interval_us",
+    "imcs_cache_coord_sample_interval",
+    "imcs_rhj_overlap_victim_node",
+    "imcs_rhj_overlap_peer_node",
+    "imcs_rhj_overlap_peer_kind",
+    "imcs_rhj_stream_schedule_llc",
+    "imcs_rhj_stream_copy_slots",
+    "imcs_chiplet_probe_tile_policy",
+    "imcs_chiplet_exchange_mode",
+    "imcs_agg_cache_slots",
+    "enable_imcs_agg_cache_window",
+    "enable_imcs_agg_cache_borrow",
+    "enable_imcs_agg_cache_chiplet",
+    "enable_imcs_agg_cache_live_pressure",
+    "enable_imcs_agg_cache_critical",
+    "imcs_nps_groups",
+    "imcs_adapt_period_ms",
     "enable_imcs_partition_scan",
     "enable_numa_aware_partition_scan",
     "enable_intra_operator_data_access",
     "enable_inter_operator_data_access",
     "imcs_partition_scan_cpus",
+    "imcs_chiplet_stage_cpus",
     "imcs_partition_numa_map",
 #endif
     "ustore_attr",
@@ -442,6 +484,14 @@ const char* sync_guc_variable_namelist[] = {"work_mem",
     "hll_max_sparse",
     "enable_sonic_optspill",
     "enable_sonic_hashjoin",
+    "enable_radix_hashjoin",
+    "radix_partition_size_mb",
+    "radix_cache_aware",
+    "radix_chiplet_aware",
+    "radix_shared_build",
+    "radix_shared_direct_send",
+    "radix_llc_size_mb",
+
     "enable_sonic_hashagg",
 #ifdef ENABLE_MULTIPLE_NODES
     "enable_stream_recursive",
@@ -4899,7 +4949,14 @@ static void InitConfigureNamesEnum()
  * should be mapped to a new one only if the new variable has very similar
  * semantics to the old.
  */
-static const char* const map_old_guc_names[] = {"sort_mem", "work_mem", "vacuum_mem", "maintenance_work_mem", NULL};
+static const char* const map_old_guc_names[] = {
+    "sort_mem", "work_mem",
+    "vacuum_mem", "maintenance_work_mem",
+#ifdef ENABLE_HTAP
+    "enable_imcs_stream_buffer_locality", "enable_imcs_stream_hotspot_split",
+#endif
+    NULL
+};
 
 static int guc_var_compare(const void* a, const void* b);
 static int guc_name_compare(const char* namea, const char* nameb);

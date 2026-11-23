@@ -111,6 +111,8 @@ public:
     DataSlotTag InitOBSSlotTag(uint32 hostNameHash, uint32 bucketNameHash, uint32 fileFirstHalfHash,
         uint32 fileSecondHalfHash, uint64 offset, uint64 length) const;
     CacheSlotId_t FindDataBlock(DataSlotTag* dataSlotTag, bool first_enter_block);
+    CacheSlotId_t PinReadyDataBlockForPlacement(DataSlotTag* dataSlotTag);
+    void UnpinDataBlockForPlacement(CacheSlotId_t slotId);
     int ReserveDataBlock(DataSlotTag* dataSlotTag, int size, bool& hasFound);
     bool ReserveDataBlockWithSlotId(int slotId);
     bool ReserveCstoreDataBlockWithSlotId(int slotId);
@@ -144,6 +146,7 @@ public:
         CacheSlotId_t slotId, const void* buffer, uint64 size, const char* prefix, const char* dataDNA);
 
     void AcquireCompressLock(CacheSlotId_t slotId);
+    bool TryLockReadyDataBlock(CacheSlotId_t slotId);
     void ReleaseCompressLock(CacheSlotId_t slotId);
 
     virtual void GetCacheBlockInProgress(CacheSlotId_t *ioCacheBlock, CacheSlotId_t *uncompressCacheBlock);

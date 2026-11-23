@@ -261,6 +261,22 @@ struct IMCSDesc {
     bool isShmNotEnough;
     /* -1: native allocation; otherwise the node selected before populate. */
     int dataNumaNode;
+    /* Immutable NPS identity plus atomics shared with the runtime Data Placer. */
+    Oid numaGroup;
+    int numaOrdinal;
+    int numaPartitions;
+    int numaGroupMembers;
+    pg_atomic_uint32 adaptDisabled;
+    pg_atomic_uint32 adaptMoving;
+    pg_atomic_uint32 adaptActiveScans;
+    RelFileNodeOld numaRelNode;
+    pg_atomic_uint32 currentNumaNode;
+    pg_atomic_uint64 numaGeneration;
+    pg_atomic_uint64 numaMappedBytes;
+    pg_atomic_uint64 adaptCpuNs;
+    pg_atomic_uint64 adaptLocalBytes;
+    pg_atomic_uint64 adaptInvalidSamples;
+    pg_atomic_uint64 adaptLeaseUntilUs;
     BorrowMemPool* borrowMemPool;
 
     IMCSDesc();
@@ -403,6 +419,7 @@ public:
     /* One page-isolated mapping contains the persistent source and offset buffers. */
     void* m_partitionWiseBuffer;
     Size m_partitionWiseBufferSize;
+    bool m_partitionWiseAccounted;
     void FreePartitionWiseBuffer();
 #endif
 

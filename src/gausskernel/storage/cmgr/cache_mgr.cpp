@@ -313,6 +313,36 @@ void CacheMgr::InitCacheBlockTag(CacheTag *cacheTag, int32 type, const void *key
  * @Return: the block desc and pinned if found, null not found
  * @See also:
  */
+/* Placement executor owns these pins explicitly. No ResourceOwner growth or
+ * logging allocations are allowed while it holds pthread row-group locks. */
+void CacheMgr::UnpinCacheBlockForPlacement(CacheSlotId_t slot)
+{
+    LockCacheDescHeader(slot);
+    Assert(m_CacheDesc[slot].m_refcount > 0);
+    --m_CacheDesc[slot].m_refcount;
+    UnLockCacheDescHeader(slot);
+}
+
+CacheSlotId_t CacheMgr::PinReadyCacheBlockForPlacement(CacheTag* tag)
+{
+    uint32 hash = GetHashCode(tag);
+    LockHashPartion(hash, LW_SHARED);
+    CacheLookupEnt* entry = (CacheLookupEnt*)hash_search_with_hash_value(m_hash, tag, hash, HASH_FIND, NULL);
+    CacheSlotId_t slot = CACHE_BLOCK_INVALID_IDX;
+    if (entry != NULL) {
+        CacheSlotId_t candidate = entry->slot_id;
+        LockCacheDescHeader(candidate);
+        unsigned char flags = m_CacheDesc[candidate].m_flag;
+        if ((flags & CACHE_BLOCK_VALID) && !(flags & (CACHE_BLOCK_IOBUSY | CACHE_BLOCK_ERROR))) {
+            ++m_CacheDesc[candidate].m_refcount;
+            slot = candidate;
+        }
+        UnLockCacheDescHeader(candidate);
+    }
+    UnLockHashPartion(hash);
+    return slot;
+}
+
 CacheSlotId_t CacheMgr::FindCacheBlock(CacheTag *cacheTag, bool first_enter_block)
 {
     CacheLookupEnt *result = NULL;
@@ -1776,6 +1806,12 @@ void CacheMgr::AcquireCompressLock(CacheSlotId_t slotId)
  * @Param[IN] slotId: slot id
  * @See also:
  */
+bool CacheMgr::TryAcquireCompressLock(CacheSlotId_t slotId)
+{
+    Assert(slotId >= 0 && slotId <= m_CaccheSlotMax && slotId < m_CacheSlotsNum);
+    return LWLockConditionalAcquire(m_CacheDesc[slotId].m_compress_lock, LW_EXCLUSIVE);
+}
+
 void CacheMgr::ReleaseCompressLock(CacheSlotId_t slotId)
 {
     Assert(slotId >= 0 && slotId <= m_CaccheSlotMax && slotId < m_CacheSlotsNum);

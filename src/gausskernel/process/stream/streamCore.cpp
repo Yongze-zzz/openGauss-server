@@ -23,6 +23,8 @@
  */
 
 #include "postgres.h"
+#include "access/htap/imcs_local_tasks.h"
+#include <new>
 #include "knl/knl_variable.h"
 #ifdef PGXC
 #include "commands/trigger.h"
@@ -60,10 +62,13 @@
 #include "pgstat.h"
 #include "tcop/tcopprot.h"
 #include "distributelayer/streamCore.h"
+#include "vectorsonic/vsonicsharedagg.h"
+#include "vecexecutor/vec_cache_coord.h"
 #include "distributelayer/streamMain.h"
 #include "distributelayer/streamProducer.h"
 #include "distributelayer/streamConsumer.h"
 #include "storage/procsignal.h"
+#include <sched.h>
 
 /* Process-wise variables. */
 MemoryContext StreamObj::m_memoryGlobalCxt = NULL;
@@ -346,6 +351,7 @@ StreamNodeGroup::StreamNodeGroup()
       m_errorStop(false),
       m_recursiveVfdInvalid(false)
 {
+    m_imcsLocalTasks = new (std::nothrow) ImcsLocalTaskQueues();
     pthread_mutex_init(&m_mutex, NULL);
     pthread_mutex_init(&m_recursiveMutex, NULL);
     pthread_cond_init(&m_cond, NULL);
@@ -366,7 +372,7 @@ StreamNodeGroup::StreamNodeGroup()
 }
 
 StreamNodeGroup::~StreamNodeGroup()
-{}
+{ delete m_imcsLocalTasks; }
 
 /*
  * @Description: Init stream node group
@@ -376,6 +382,27 @@ StreamNodeGroup::~StreamNodeGroup()
  */
 void StreamNodeGroup::Init(int threadNum)
 {
+#ifdef ENABLE_HTAP
+    const auto& sql = u_sess->attr.attr_sql;
+    int probeTilePolicy = sql.imcs_chiplet_probe_tile_policy;
+    if (m_streamRuntimeContext != NULL && (probeTilePolicy == 2 || probeTilePolicy == 3 || probeTilePolicy == 5) &&
+        sql.radix_shared_build && sql.enable_imcs_nps && !sql.enable_imcs_adapt &&
+        !sql.enable_imcs_stream_consumer_placement)
+        m_chipletCacheActivity = CreateChipletCacheActivity(m_streamRuntimeContext);
+    bool limitCopies = sql.imcs_rhj_overlap_peer_kind == 2 && sql.radix_shared_build &&
+        sql.imcs_rhj_stream_copy_slots > 0 && sql.imcs_rhj_stream_schedule_llc != -1;
+    if (m_streamRuntimeContext != NULL &&
+        (sql.imcs_rhj_overlap_peer_kind == 0 || sql.enable_cache_trace ||
+         sql.imcs_rhj_stream_schedule_llc >= 0 || limitCopies) &&
+        sql.imcs_rhj_overlap_victim_node > 0 && sql.imcs_rhj_overlap_peer_node > 0 &&
+        sql.imcs_rhj_overlap_victim_node != sql.imcs_rhj_overlap_peer_node) {
+        m_rhjProbeOverlap = (RhjProbeOverlapDomain*)MemoryContextAllocZero(m_streamRuntimeContext,
+            CPU_SETSIZE * sizeof(*m_rhjProbeOverlap));
+        if (limitCopies)
+            m_rhjStreamCopies = (uint32*)MemoryContextAllocZero(m_streamRuntimeContext,
+                CPU_SETSIZE * sizeof(*m_rhjStreamCopies));
+    }
+#endif
     m_size = threadNum + 1; /* all stream thead + top consumer thread */
     m_streamArray = (StreamNode*)palloc0(sizeof(StreamNode) * m_size);
     for (int i = 0; i < m_size; i++)
@@ -1123,6 +1150,10 @@ void StreamNodeGroup::deInit(StreamObjStatus status)
 
         pg_usleep(1000);
     } while (saveQuit == false);
+
+#ifdef ENABLE_HTAP
+    DestroySonicAggExchanges(this);
+#endif
 
     /* release the socket in case not release. */
     foreach (cell, m_streamProducerList) {

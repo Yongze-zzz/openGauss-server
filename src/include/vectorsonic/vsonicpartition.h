@@ -66,7 +66,7 @@ public:
     size_t m_size;
 
 public:
-    SonicHashPartition(const char* cxtname, uint16 cols, int64 workMem, bool useRack = false);
+    SonicHashPartition(const char* cxtname, uint16 cols, int64 workMem, bool useRack = false, bool shared = false);
     ~SonicHashPartition(){};
 
     virtual void freeResources()
@@ -125,7 +125,9 @@ public:
     SonicDatumArray* m_segNext;
 
 public:
-    SonicHashMemPartition(const char* cxtname, bool hasHash, TupleDesc tupleDesc, int64 workMem);
+    uint32 m_atomCapacity;
+    SonicHashMemPartition(const char* cxtname, bool hasHash, TupleDesc tupleDesc, int64 workMem,
+        uint32 atomCapacity = INIT_DATUM_ARRAY_SIZE, bool shared = false);
     ~SonicHashMemPartition(){};
 
     void init(uint16 colIdx, DatumDesc* desc);
@@ -133,6 +135,10 @@ public:
     void freeResources();
 
     void putBatch(VectorBatch* batch);
+
+    /* Append the rows of one batch into multiple radix partitions. */
+    static void putBatchByPartition(SonicHashMemPartition** partitions, uint32 numParts, VectorBatch* batch,
+        uint32* partIdx, uint32* hashVals);
 
     void flushPartition(int arrIdx, uint32* partIdx, SonicHashPartition** filePartitions, int nrows);
 

@@ -33,13 +33,17 @@
 #include "nodes/plannodes.h"
 #include "vecexecutor/vectorbatch.h"
 #include "vecexecutor/vecexecutor.h"
+#include "distributelayer/streamProducer.h"
+#include "access/htap/imcs_local_tasks.h"
 
 #ifdef ENABLE_HTAP
     #include "access/htap/imcs_hash_table.h"
     #include "access/htap/imcs_partition_wise.h"
+    #include "access/htap/imcstore_am.h"
     #include "vecexecutor/vecnodeimcstorescan.h"
     #include "storage/cu.h"
     #include "utils/rel_gs.h"
+    #include "utils/partitionmap.h"
 #endif
 
 VecPartIteratorState* ExecInitVecPartIterator(VecPartIterator* node, EState* estate, int eflags)
@@ -127,14 +131,16 @@ static CStoreScanState* GetPartitionWiseScan(VecPartIteratorState* node)
         u_sess->attr.attr_sql.enable_cstore_partition_lane_scan;
 #ifdef ENABLE_HTAP
     bool imcsScan = IsA(node->ps.lefttree, IMCStoreScanState);
+    bool wholePartition = ((VecPartIterator*)node->ps.plan)->wholePartitionPerWorker;
     /* NUMA scheduling adds locality to whole-partition scans; it does not enable them. */
     if (imcsScan && u_sess->attr.attr_sql.enable_numa_aware_partition_scan &&
-        !u_sess->attr.attr_sql.enable_imcs_partition_scan) {
+        !u_sess->attr.attr_sql.enable_imcs_partition_scan && !u_sess->attr.attr_sql.enable_imcs_nps) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("NUMA-aware IMCS partition scans require enable_imcs_partition_scan"),
             errhint("Set enable_imcs_partition_scan = on before running the scan.")));
     }
-    enabled = enabled || (imcsScan && u_sess->attr.attr_sql.enable_imcs_partition_scan);
+    enabled = enabled || (imcsScan && (u_sess->attr.attr_sql.enable_imcs_partition_scan ||
+        u_sess->attr.attr_sql.enable_imcs_nps || wholePartition));
 #endif
     if (!enabled)
        return NULL;
@@ -152,6 +158,55 @@ static CStoreScanState* GetPartitionWiseScan(VecPartIteratorState* node)
 }
 
 #ifdef ENABLE_HTAP
+static bool UseImcsLocalTasks(VecPartIteratorState* node)
+{
+    if (!u_sess->attr.attr_sql.enable_imcs_local_task_queue) return false;
+    if (!u_sess->attr.attr_sql.enable_imcs_nps ||
+        !u_sess->attr.attr_sql.enable_imcs_adapt ||
+        u_sess->attr.attr_sql.enable_imcs_adapt_migration)
+        ereport(ERROR, (errmsg("IMCS local tasks require NPS, Adapt affinity and migration disabled")));
+    // Never redistribute fused join inputs independently: their SMP-lane
+    // ownership can be part of the local join's distribution contract.
+    StreamProducer* producer = u_sess->stream_cxt.producer_obj;
+    return producer != NULL && u_sess->stream_cxt.global_obj != NULL &&
+        producer->allowsImcsLocalTasks() &&
+        producer->getPlan() != NULL && producer->getPlan()->planTree == node->ps.plan &&
+        node->ps.plan->extParam == NULL && node->ps.plan->recursive_union_plan_nodeid == 0;
+}
+
+static int ClaimImcsLocalPartition(VecPartIteratorState* node, CStoreScanState* scan,
+                                   int partitions, int worker, int dop, bool backward)
+{
+    StreamNodeGroup* group = u_sess->stream_cxt.global_obj;
+    if (group->m_imcsLocalTasks == NULL)
+        ereport(ERROR, (errmsg("Cannot allocate IMCS local task queues")));
+    // Resolve all PostgreSQL metadata before taking the C++ queue mutex.
+    int home = ImcsPartitionWiseWorkerNode(worker, dop);
+    Oid* oids = (Oid*)palloc(sizeof(Oid) * partitions);
+    int* nodes = (int*)palloc(sizeof(int) * partitions);
+    int index = 0;
+    ListCell* cell = NULL;
+    foreach (cell, scan->partitions) {
+        oids[index] = ((Partition)lfirst(cell))->pd_id;
+        nodes[index] = ImcsPartitionWiseWorkerNode(node->partitionWiseWorkers[index], dop);
+        ++index;
+    }
+    int claimed = -1;
+    try {
+        std::vector<unsigned int> ids(oids, oids + partitions);
+        std::vector<int> homes(nodes, nodes + partitions);
+        claimed = group->m_imcsLocalTasks->claim(node->ps.plan->plan_node_id,
+            node->imcsLocalTaskGeneration, backward ? -1 : 1, home, ids, homes);
+    } catch (const std::exception& error) {
+        // claim() has released its mutex before PostgreSQL error handling.
+        ereport(ERROR, (errmsg("IMCS local partition claim failed: %s", error.what())));
+    }
+    pfree(oids);
+    pfree(nodes);
+    if (claimed >= 0) ImcsLocalTaskRecord(node->partitionWiseWorkers[claimed] != worker);
+    return claimed < 0 ? partitions : (backward ? partitions - claimed - 1 : claimed);
+}
+
 static void InitImcsNumaPartitionWorkers(VecPartIteratorState* node, CStoreScanState* scan, int partitions)
 {
     int workers = (int)u_sess->stream_cxt.producer_dop;
@@ -160,22 +215,145 @@ static void InitImcsNumaPartitionWorkers(VecPartIteratorState* node, CStoreScanS
         ereport(ERROR, (errmsg("IMCS PartitionWise partition list does not match the pruning result")));
     node->partitionWiseWorkers = (int*)MemoryContextAlloc(node->ps.state->es_query_cxt, sizeof(int) * partitions);
     int nodeOrdinals[sizeof(unsigned long) * 8] = {0};
+    bool chipletOwner = ((VecPartIterator*)node->ps.plan)->chipletJoinOwner;
+    HashPartitionMap* buckets = NULL;
+    if (chipletOwner) {
+        Relation parent = scan->ss_partition_parent;
+        if (parent == NULL || parent->partMap == NULL || !PartitionMapIsHash(parent->partMap))
+            ereport(ERROR, (errmsg("Chiplet bucket ownership requires an IMCS hash-partitioned table")));
+        buckets = (HashPartitionMap*)parent->partMap;
+    }
     int index = 0;
     ListCell* cell = NULL;
     foreach (cell, scan->partitions) {
         CHECK_FOR_INTERRUPTS();
         Oid oid = ((Partition)lfirst(cell))->pd_id;
         IMCSDesc* desc = IMCS_HASH_TABLE->GetImcsDesc(oid);
-        if (desc == NULL || desc->dataNumaNode < 0 || desc->dataNumaNode >= (int)lengthof(nodeOrdinals))
+        if (chipletOwner) {
+            int ordinal = desc == NULL ? -1 : desc->numaOrdinal;
+            if (ordinal < 0 || ordinal >= buckets->hashElementsNum || buckets->hashElements[ordinal].partitionOid != oid) {
+                for (ordinal = 0; ordinal < buckets->hashElementsNum; ++ordinal) {
+                    if (buckets->hashElements[ordinal].partitionOid == oid)
+                        break;
+                }
+                if (ordinal == buckets->hashElementsNum)
+                    ereport(ERROR, (errmsg("Unable to identify the IMCS hash bucket for partition %u", oid)));
+            }
+            node->partitionWiseWorkers[index++] = ImcsPartitionWiseBucketOwner(ordinal, workers);
+            continue;
+        }
+        /* Keep ownership immutable across all workers and rescans. Adapt may
+         * change the physical node while other workers initialize this array;
+         * following that node at batch boundaries must never change ownership. */
+        int dataNode = desc == NULL ? -1 : desc->dataNumaNode;
+        if (u_sess->attr.attr_sql.enable_imcs_nps && desc != NULL && !OidIsValid(desc->numaGroup))
+            ereport(ERROR, (errmsg("Partition %u was not populated using a validated NPS layout", oid)));
+        if (dataNode < 0 || dataNode >= (int)lengthof(nodeOrdinals))
             ereport(ERROR, (errmsg("IMCS partition %u has no NUMA data layout", oid),
                 errhint("Set imcs_partition_numa_map before repopulating this partition.")));
         /* Count within the data node, not across interleaved global partition indices. */
-        int ordinal = nodeOrdinals[desc->dataNumaNode]++;
-        node->partitionWiseWorkers[index] = ImcsPartitionWiseWorker(index, ordinal, desc->dataNumaNode, workers);
+        int ordinal = nodeOrdinals[dataNode]++;
+        node->partitionWiseWorkers[index] = ImcsPartitionWiseWorker(index, ordinal, dataNode, workers);
         ereport(DEBUG1, (errmsg("IMCS PartitionWise partition=%u node=%d worker=%d",
-            oid, desc->dataNumaNode, node->partitionWiseWorkers[index])));
+            oid, dataNode, node->partitionWiseWorkers[index])));
         ++index;
     }
+}
+
+static bool UseImcsCuBalance(VecPartIteratorState* node, CStoreScanState* scan)
+{
+    const auto& sql = u_sess->attr.attr_sql;
+    Plan* plan = node->ps.plan;
+    if (!sql.enable_imcs_nps_cu_balance || !sql.enable_imcs_nps || sql.enable_imcs_adapt ||
+        sql.enable_imcs_local_task_queue || ENABLE_DMS || plan->ispwj || plan->extParam != NULL ||
+        plan->recursive_union_plan_nodeid != 0 || scan->isSampleScan || scan->rangeScanInRedis.isRangeScanInRedis ||
+        ((VecPartIterator*)plan)->direction != ForwardScanDirection)
+        return false;
+
+    StreamProducer* producer = u_sess->stream_cxt.producer_obj;
+    StreamNodeGroup* group = u_sess->stream_cxt.global_obj;
+    if (producer == NULL || group == NULL || group->m_imcsLocalTasks == NULL ||
+        !producer->allowsImcsLocalTasks(true) || producer->getPlan() == NULL)
+        return false;
+    const Plan* root = producer->getPlan()->planTree;
+    if (root == plan)
+        return true;
+    /* The broadcast build is identical for every local probe lane. The
+     * producer's outbound redistribution (or gather) removes lane ownership. */
+    if (root == NULL || !IsA(root, VecHashJoin) || root->ispwj || root->extParam != NULL ||
+        outerPlan(root) != plan || innerPlan(root) == NULL || !IsA(innerPlan(root), VecStream) ||
+        ((const VecHashJoin*)root)->join.jointype != JOIN_INNER)
+        return false;
+    const Stream* build = (const Stream*)innerPlan(root);
+    return build->type == STREAM_BROADCAST && build->smpDesc.distriType == LOCAL_BROADCAST;
+}
+
+static void InitImcsCuRanges(VecPartIteratorState* node, CStoreScanState* scan, int partitions, int worker, int dop)
+{
+    Oid* oids = (Oid*)palloc(sizeof(Oid) * partitions);
+    int* homes = (int*)palloc(sizeof(int) * partitions);
+    uint32* limits = (uint32*)palloc(sizeof(uint32) * partitions);
+    const int home = ImcsPartitionWiseWorkerNode(worker, dop);
+    int nodeWorkers[sizeof(unsigned long) * 8] = {};
+    int localIndex = 0;
+    for (int lane = 0; lane < dop; ++lane) {
+        int nodeId = ImcsPartitionWiseWorkerNode(lane, dop);
+        ++nodeWorkers[nodeId];
+        localIndex += lane < worker && nodeId == home;
+    }
+    int i = 0;
+    bool allHomesActive = true;
+    ListCell* cell = NULL;
+    foreach (cell, scan->partitions) {
+        Oid oid = ((Partition)lfirst(cell))->pd_id;
+        IMCSDesc* desc = IMCS_HASH_TABLE->GetImcsDesc(oid);
+        if (desc == NULL || desc->imcsDescLock == NULL) {
+            allHomesActive = false;
+            break;
+        }
+        oids[i] = oid;
+        homes[i] = desc->dataNumaNode;
+        allHomesActive = allHomesActive && nodeWorkers[homes[i]] > 0;
+        LWLockAcquire(desc->imcsDescLock, LW_SHARED);
+        limits[i] = desc->curMaxRowGroupId + 1;
+        LWLockRelease(desc->imcsDescLock);
+        ++i;
+    }
+
+    if (allHomesActive) {
+        try {
+            std::vector<unsigned int> ids(oids, oids + partitions);
+            u_sess->stream_cxt.global_obj->m_imcsLocalTasks->freezeCuLimits(node->ps.plan->plan_node_id,
+                node->imcsLocalTaskGeneration, ids, limits);
+        } catch (const std::exception& error) {
+            ereport(ERROR, (errmsg("Cannot determine IMCS CU ranges: %s", error.what())));
+        }
+
+        uint64 total = 0;
+        for (i = 0; i < partitions; ++i) {
+            if (homes[i] == home)
+                total += limits[i];
+        }
+        uint64 begin = total * localIndex / nodeWorkers[home];
+        uint64 end = total * (localIndex + 1) / nodeWorkers[home];
+        uint64 offset = 0;
+        auto* ranges = (ImcsPartitionCuRange*)MemoryContextAllocZero(node->ps.state->es_query_cxt,
+            sizeof(ImcsPartitionCuRange) * partitions);
+        for (i = 0; i < partitions && offset < end; ++i) {
+            if (homes[i] != home)
+                continue;
+            uint64 next = offset + limits[i];
+            if (begin < next)
+                ranges[i] = {(uint32)(Max(begin, offset) - offset), (uint32)(Min(end, next) - offset)};
+            offset = next;
+        }
+        node->partitionCuRanges = ranges;
+        ereport(DEBUG1, (errmsg("IMCS CU balance node=%d worker=%d home=%d assigned_cus=%lu local_cus=%lu",
+            node->ps.plan->plan_node_id, worker, home, end - begin, total)));
+    }
+    pfree(oids);
+    pfree(homes);
+    pfree(limits);
 }
 #endif
 
@@ -217,11 +395,29 @@ static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
         /* Plain partition scans reuse CStore's static round-robin iteration. */
         int nextItr = (node->currentItr < 0) ? worker : node->currentItr + dop;
 #ifdef ENABLE_HTAP
-        /* Only the NUMA option reads data-node metadata and binds the worker. */
-        if (wiseScan->m_isImcstore && u_sess->attr.attr_sql.enable_numa_aware_partition_scan) {
-            if (node->partitionWiseWorkers == NULL)
+        bool wholePartition = pi_node->wholePartitionPerWorker;
+        /* With changing data placement, a final aggregate still needs
+         * deterministic partition ownership across all its workers. */
+        if (wiseScan->m_isImcstore && (pi_node->chipletJoinOwner ||
+            ((u_sess->attr.attr_sql.enable_numa_aware_partition_scan || u_sess->attr.attr_sql.enable_imcs_nps) &&
+                !(wholePartition && u_sess->attr.attr_sql.enable_imcs_adapt)))) {
+            if (node->partitionWiseWorkers == NULL) {
                 InitImcsNumaPartitionWorkers(node, wiseScan, partitionScan);
-            for (nextItr = node->currentItr + 1; nextItr < partitionScan; ++nextItr) {
+                if (!wholePartition && UseImcsCuBalance(node, wiseScan))
+                    InitImcsCuRanges(node, wiseScan, partitionScan, worker, dop);
+            }
+            if (node->partitionCuRanges != NULL) {
+                for (nextItr = node->currentItr + 1; nextItr < partitionScan; ++nextItr) {
+                    const auto& range = node->partitionCuRanges[nextItr];
+                    if (range.first < range.limit) {
+                        ((IMCStore*)wiseScan->m_CStore)->SetPartitionCuRange(range.first, range.limit);
+                        break;
+                    }
+                }
+            } else if (!wholePartition && UseImcsLocalTasks(node)) {
+                nextItr = ClaimImcsLocalPartition(node, wiseScan, partitionScan, worker, dop,
+                    BackwardScanDirection == pi_node->direction);
+            } else for (nextItr = node->currentItr + 1; nextItr < partitionScan; ++nextItr) {
                 int index = BackwardScanDirection == pi_node->direction ? partitionScan - nextItr - 1 : nextItr;
                 if (node->partitionWiseWorkers[index] == worker)
                     break;
@@ -335,7 +531,14 @@ void ExecReScanVecPartIterator(VecPartIteratorState* node)
     }
 
     node->currentItr = -1;
+    ++node->imcsLocalTaskGeneration;
     pfree_ext(node->partitionWiseWorkers); /* Rebuild from this scan's current pruning list. */
+#ifdef ENABLE_HTAP
+    if (node->partitionCuRanges != NULL) {
+        ((IMCStore*)((CStoreScanState*)node->ps.lefttree)->m_CStore)->SetPartitionCuRange(0, 0);
+        pfree_ext(node->partitionCuRanges);
+    }
+#endif
 
     pi_node = (VecPartIterator*)node->ps.plan;
     paramno = pi_node->param->paramno;

@@ -1182,6 +1182,7 @@ inline VectorBatch* SonicHashJoin::probeMemoryTable(SonicHashSource* probeP)
 
     mask = mem_partition->m_mask;
 
+
     for (;;) {
         switch (m_probeStatus) {
             case PROBE_FETCH: {

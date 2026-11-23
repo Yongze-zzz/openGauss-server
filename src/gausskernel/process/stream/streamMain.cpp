@@ -22,6 +22,7 @@
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "vecexecutor/vecexecutor.h"
 
 #include "access/gtm.h"
 #include "access/multi_redo_api.h"
@@ -53,6 +54,7 @@
 
 #ifdef ENABLE_HTAP
 #include "access/htap/imcs_partition_wise.h"
+#include "optimizer/stream_cost.h"
 #endif
 
 extern void CodeGenThreadInitialize();
@@ -347,11 +349,12 @@ void ExtractProduerSkewInfo()
 
 static void HandleStreamSigjmp()
 {
+    VecCacheTraceDiscard();
     pgstat_report_waitstatus(STATE_WAIT_UNDEFINED);
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
-// #ifdef ENABLE_HTAP
-//     ImcsPartitionWiseWorkerLeave();
-// #endif
+#ifdef ENABLE_HTAP
+    ImcsPartitionWiseWorkerLeave();
+#endif
     /* output the memory tracking information when error happened */
     MemoryTrackingOutputFile();
 
@@ -415,6 +418,39 @@ static void HandleStreamSigjmp()
     timeInfoRecordEnd();
     StreamNodeGroup::syncQuit(STREAM_ERROR);
 }
+
+#ifdef ENABLE_HTAP
+static bool IsChipletStageInput(const Plan* plan, int dop)
+{
+    if (plan == NULL || !IsA(plan, VecStream))
+        return false;
+    const Stream* input = (const Stream*)plan;
+    return input->type == STREAM_REDISTRIBUTE && input->smpDesc.distriType == LOCAL_DISTRIBUTE &&
+        input->smpDesc.consumerDop == dop && input->sort == NULL && !input->is_recursive_local &&
+        !input->is_sorted && !input->chipletOwnerHandoff;
+}
+
+static int ChipletExchangeStage(StreamProducer* producer, const Plan* plan, int dop)
+{
+    const auto& sql = u_sess->attr.attr_sql;
+    if (sql.imcs_chiplet_stage_cpus == NULL || *sql.imcs_chiplet_stage_cpus == '\0' || sql.enable_imcs_adapt ||
+        sql.enable_imcs_stream_consumer_placement || sql.enable_imcs_local_task_queue ||
+        !producer->isLocalStream() || plan == NULL || plan->ispwj || plan->extParam != NULL ||
+        plan->initPlan != NIL || plan->recursive_union_plan_nodeid > 0)
+        return 0;
+
+    if (IsA(plan, VecHashJoin) && IsChipletStageInput(outerPlan(plan), dop) &&
+        IsChipletStageInput(innerPlan(plan), dop))
+        return plan->plan_node_id;
+
+    const ParallelDesc exchange = producer->getParallelDesc();
+    if (sql.imcs_chiplet_exchange_mode >= 5 && exchange.distriType == LOCAL_BROADCAST &&
+        exchange.producerDop == dop && dop < exchange.consumerDop && IsA(plan, IMCStoreScan) &&
+        !((const IMCStoreScan*)plan)->isPartTbl)
+        return plan->plan_node_id;
+    return 0;
+}
+#endif
 
 static void execute_stream_plan(StreamProducer* producer)
 {
@@ -515,6 +551,28 @@ static void execute_stream_plan(StreamProducer* producer)
     /*
      * Start the portal.  No parameters here.
      */
+#ifdef ENABLE_HTAP
+    /* Establish CPU/local-allocation preference before ExecutorStart allocates
+     * private aggregate/join state. Ownership still uses immutable scan lanes. */
+    if (u_sess->stream_cxt.producer_dop > 1) {
+        if (u_sess->attr.attr_sql.enable_imcs_nps) {
+            int dop = (int)u_sess->stream_cxt.producer_dop;
+            int stage = ChipletExchangeStage(producer, planstmt->planTree, dop);
+            ImcsPartitionWiseWorkerEnter((int)u_sess->stream_cxt.smp_id, dop, stage);
+        }
+        // The shipped plan is already fixed. Do not gate execution affinity on
+        // enable_imcsscan: it is a planner-only flag, not Stream-synchronized.
+        else if (u_sess->attr.attr_sql.enable_imcs_partition_scan &&
+                 !u_sess->attr.attr_sql.enable_numa_aware_partition_scan)
+            ImcsPartitionWisePoolEnter();
+    }
+#endif
+    /* With the opt-in inter-operator policy, netInit deliberately left local
+     * Stream buffers uninitialized. First-touch them only after NPS fixed this
+     * producer lane's CPU and memory preference. The call is idempotent, so
+     * legacy and non-NPS paths keep their original allocation placement. */
+    if (producer->isLocalStream())
+        producer->initSharedContext();
     PortalStart(portal, producer->getParams(), 0, producer->getSnapShot());
 
     format = 0;

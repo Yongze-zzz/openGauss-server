@@ -27,6 +27,9 @@
 #include "knl/knl_variable.h"
 
 #include "access/hash.h"
+#ifdef ENABLE_HTAP
+#include "access/htap/imcs_partition_wise.h"
+#endif
 #include "access/printtup.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -79,6 +82,28 @@
 extern void StreamSaveTxnContext(StreamTxnContext* stc);
 extern void StreamRestoreTxnContext(StreamTxnContext* stc);
 
+#ifdef ENABLE_HTAP
+static bool ImcsStreamKeyLineage(PlannedStmt* pstmt, Stream* stream, Oid* relation, AttrNumber* attribute)
+{
+    if (pstmt == NULL || stream == NULL || list_length(stream->distribute_keys) != 1)
+        return false;
+    Node* key = (Node*)linitial(stream->distribute_keys);
+    if (!IsA(key, Var))
+        return false;
+    Var* var = (Var*)key;
+    Index rteIndex = (!IS_SPECIAL_VARNO(var->varnoold) && var->varnoold > 0) ? var->varnoold : var->varno;
+    AttrNumber attno = var->varoattno > 0 ? var->varoattno : var->varattno;
+    if (IS_SPECIAL_VARNO(rteIndex) || rteIndex == 0 || rteIndex > (Index)list_length(pstmt->rtable) || attno <= 0)
+        return false;
+    RangeTblEntry* rte = rt_fetch(rteIndex, pstmt->rtable);
+    if (rte == NULL || rte->rtekind != RTE_RELATION || !OidIsValid(rte->relid))
+        return false;
+    *relation = rte->relid;
+    *attribute = attno;
+    return true;
+}
+#endif
+
 StreamProducer::StreamProducer(
     StreamKey key, PlannedStmt* pstmt, Stream* snode, MemoryContext context, int socketNum, StreamTransType transType)
     : StreamObj(context, STREAM_PRODUCER)
@@ -100,6 +125,15 @@ StreamProducer::StreamProducer(
     m_disQuickLocator = NULL;
     m_sharedContext = NULL;
     m_sharedContextInit = false;
+    m_radixBroadcastChannels = NULL;
+    m_radixBroadcastChannelCount = 0;
+#ifdef ENABLE_HTAP
+    m_deferSharedContextInit = u_sess->attr.attr_sql.enable_imcs_nps &&
+        u_sess->attr.attr_sql.enable_imcs_stream_hotspot_split;
+    m_imcsHotflowEligible = false;
+#else
+    m_deferSharedContextInit = false;
+#endif
     m_broadcastSize = 0;
     m_threadInit = false;
     m_uniqueSQLId = 0;
@@ -373,6 +407,25 @@ void StreamProducer::setDistributeInfo()
     }
 #else
     setDistributeIdx();
+#endif
+
+#ifdef ENABLE_HTAP
+    /* Every producer feeding the same local redistribution must use the same
+     * mapping, including branches that do not contain an IMCS scan themselves.
+     * Prepare it once per StreamProducer, never from the per-row localizer. */
+    if (u_sess->attr.attr_sql.enable_imcs_nps &&
+        u_sess->attr.attr_sql.enable_imcs_stream_hotflow_colocation &&
+        m_parallel_desc.distriType == LOCAL_DISTRIBUTE &&
+        m_parallel_desc.producerDop == m_parallel_desc.consumerDop &&
+        list_length(m_distributeKey) == 1) {
+        Oid relation = InvalidOid;
+        AttrNumber attribute = InvalidAttrNumber;
+        m_imcsHotflowEligible = ImcsStreamKeyLineage(m_plan, m_streamNode, &relation, &attribute) &&
+            ImcsPartitionWiseHashInitForKey(m_parallel_desc.consumerDop, relation, attribute);
+        ereport(DEBUG1, (errmsg("IMCS hot-flow stream=%d eligible=%s relation=%u attribute=%d",
+            m_streamNode->scan.plan.plan_node_id, m_imcsHotflowEligible ? "true" : "false",
+            relation, attribute)));
+    }
 #endif
 
     if (((Plan*)m_streamNode)->vec_output == false)
@@ -948,8 +1001,10 @@ void StreamProducer::netInit()
 
     /* Local stream do not need net buffer. */
     if (STREAM_IS_LOCAL_NODE(m_streamNode->smpDesc.distriType)) {
-        /* Init shared context for local stream */
-        u_sess->stream_cxt.producer_obj->initSharedContext();
+        /* Normally preserve the existing first-touch point. The opt-in NPS
+         * policy initializes after the worker has entered its execution lane. */
+        if (!m_deferSharedContextInit)
+            initSharedContext();
         return;
     }
 
@@ -1024,6 +1079,25 @@ void StreamProducer::localBroadCastStream(TupleTableSlot* tuple)
  */
 void StreamProducer::localBroadCastStream(VectorBatch* batchSrc)
 {
+#ifdef ENABLE_HTAP
+    if (m_radixBroadcastChannels != NULL) {
+        CHECK_FOR_INTERRUPTS();
+        int producer = (int)u_sess->stream_cxt.smp_id;
+        int openChannels = 0;
+        for (int i = 0; i < m_radixBroadcastChannelCount; ++i) {
+            int channel = m_radixBroadcastChannels[i];
+            if (m_sharedContext->is_connect_end[channel][producer])
+                continue;
+            gs_memory_send(NULL, batchSrc, m_sharedContext, channel, -1);
+            if (!m_sharedContext->is_connect_end[channel][producer])
+                m_radixBroadcastChannels[openChannels++] = channel;
+        }
+        m_radixBroadcastChannelCount = openChannels;
+        if (openChannels == 0)
+            u_sess->exec_cxt.executorStopFlag = true;
+        return;
+    }
+#endif
     for (int i = 0; i < m_connNum; i++) {
         sendByMemory(NULL, batchSrc, i);
     }
@@ -1053,6 +1127,11 @@ void StreamProducer::localRedistributeStream(TupleTableSlot* tuple)
 void StreamProducer::localRedistributeStream(VectorBatch* batch)
 {
     Assert(m_sharedContext != NULL);
+
+    if (m_streamNode->chipletOwnerHandoff) {
+        sendByMemory(NULL, batch, (int)u_sess->stream_cxt.smp_id);
+        return;
+    }
 
     (this->*m_channelCalVecFun)(batch);
 
@@ -1799,6 +1878,18 @@ inline uint2 StreamProducer::NodeLocalizerForSlice(Const** distValues)
  */
 inline int StreamProducer::ThreadLocalizer(ScalarValue hashValue, int dop)
 {
+#ifdef ENABLE_HTAP
+    if (u_sess->attr.attr_sql.enable_imcs_nps &&
+        u_sess->attr.attr_sql.enable_imcs_stream_hotflow_colocation &&
+        m_imcsHotflowEligible &&
+        m_parallel_desc.distriType == LOCAL_DISTRIBUTE &&
+        m_parallel_desc.producerDop == m_parallel_desc.consumerDop &&
+        list_length(m_distributeKey) == 1) {
+        int worker = ImcsPartitionWiseHashWorker((uint64)hashValue, dop);
+        if (worker >= 0)
+            return worker;
+    }
+#endif
     return (hashValue / BUCKETDATALEN) % dop;
 }
 
@@ -1926,6 +2017,12 @@ void StreamProducer::finalizeLocalStream()
     if (NULL == m_sharedContext)
         return;
     gs_memory_send_finish(m_sharedContext, m_connNum);
+#ifdef ENABLE_HTAP
+    if (m_radixBroadcastChannels != NULL && u_sess->stream_cxt.smp_id == 0) {
+        ereport(LOG, (errmsg("RHJ direct broadcast node=%d active_channels=%d original_channels=%d",
+            m_streamNode->scan.plan.plan_node_id, m_radixBroadcastChannelCount, m_connNum)));
+    }
+#endif
 }
 
 /*
@@ -1936,13 +2033,35 @@ void StreamProducer::finalizeLocalStream()
 void StreamProducer::initSharedContext()
 {
     /* Only init when we already create a shared context for local stream. */
-    if (m_sharedContext == NULL)
+    if (m_sharedContext == NULL || m_sharedContextInit)
         return;
 
     if (m_sharedContext->vectorized) {
+#ifdef ENABLE_HTAP
+        if (m_sharedContext->radixBuildSlots != NULL && !m_streamNode->is_recursive_local &&
+            m_streamNode->scan.plan.recursive_union_plan_nodeid <= 0 &&
+            m_parallel_desc.distriType == LOCAL_BROADCAST &&
+            (u_sess->attr.attr_sql.radix_shared_direct_send ||
+                m_sharedContext->radixBroadcastReceiverDomains != NULL)) {
+            /* A nonrecursive local channel stays closed once its consumer
+             * disconnects. Keep the compact list private to this producer. */
+            m_radixBroadcastChannels = (int*)palloc(sizeof(int) * m_connNum);
+            m_radixBroadcastChannelCount = 0;
+            for (int i = 0; i < m_connNum; ++i) {
+                if (m_sharedContext->radixBroadcastReceiverDomains == NULL ||
+                    m_sharedContext->radixBroadcastReceiverDomains[i] > 0)
+                    m_radixBroadcastChannels[m_radixBroadcastChannelCount++] = i;
+            }
+        }
+#endif
         /* Init batches. */
-        for (int i = 0; i < m_connNum; i++) {
-            m_sharedContext->sharedBatches[i][u_sess->stream_cxt.smp_id] =
+        int producer = (int)u_sess->stream_cxt.smp_id;
+        if (m_sharedContext->batchRingProducers != NULL)
+            m_sharedContext->batchRingProducers[producer].batchContext = CurrentMemoryContext;
+        int begin = m_streamNode->chipletOwnerHandoff ? producer : 0;
+        int end = m_streamNode->chipletOwnerHandoff ? producer + 1 : m_connNum;
+        for (int i = begin; i < end; i++) {
+            m_sharedContext->sharedBatches[i][producer] =
                 New(CurrentMemoryContext) VectorBatch(CurrentMemoryContext, m_desc);
         }
     } else {

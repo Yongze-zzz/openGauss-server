@@ -57,6 +57,7 @@ struct IMCStoreView {
 };
 
 extern Datum query_imcstore_views(PG_FUNCTION_ARGS);
+extern Datum imcs_adapt_status(PG_FUNCTION_ARGS);
 
 extern IMCStoreView* SearchAllIMCStoreViews(uint32 *num);
 #endif // QUERY_IMCSTORE_VIEWS_H

@@ -42,6 +42,7 @@
 #include "pgstat.h"
 #include "catalog/pg_type.h"
 #include "access/htap/imcstore_am.h"
+#include "access/htap/imcs_adaptive.h"
 #include "storage/custorage.h"
 #include "storage/remote_read.h"
 #include "utils/builtins.h"
@@ -113,6 +114,7 @@ void IMCStore::InitScan(CStoreScanState* state, Snapshot snapshot)
     m_relation = state->ss_currentRelation;
 
     m_imcstoreDesc = IMCS_HASH_TABLE->GetImcsDesc(RelationGetRelid(m_relation));
+    ImcsAdaptScanInit(this, m_imcstoreDesc);
     UnlockRowGroups();
     u_sess->imcstore_ctx.pinnedRowGroups = NIL;
     m_ctidCol = m_imcstoreDesc->imcsNatts;
@@ -313,8 +315,8 @@ bool IMCStore::ImcstoreFillByDeltaScan(_in_ CStoreScanState* state, _out_ Vector
         totalThread *= SS_IMCU_CACHE->spqNodeNum;
         currentThreadID = SS_IMCU_CACHE->curSpqIdx + currentThreadID * SS_IMCU_CACHE->spqNodeNum;
     }
-    for (uint32 currid = m_delMaskCUId == InValidCUID ? 0 : m_delMaskCUId; currid <= cuid; ++currid) {
-        /* A statically assigned partition includes all main CUs and delta groups. */
+    for (uint32 currid = m_delMaskCUId == InValidCUID ? m_startCUID : m_delMaskCUId; currid <= cuid; ++currid) {
+        /* Main CUs and their delta rows use the same scan range. */
         if (!m_partitionWiseScan && totalThread > 1 && currid % totalThread != currentThreadID) {
             continue;
         }
@@ -340,8 +342,8 @@ void IMCStore::SetScanRange()
 {
     uint32 maxCuId = IMCStore::GetMaxCUID(m_imcstoreDesc, m_relation);
 
-    m_startCUID = 0;
-    m_endCUID = maxCuId;
+    m_startCUID = m_partitionFirstCu;
+    m_endCUID = m_partitionCuLimit == 0 ? maxCuId : Min(maxCuId, m_partitionCuLimit - 1);
 }
 
 void IMCStore::InitPartReScan(Relation rel)
@@ -357,6 +359,7 @@ void IMCStore::InitPartReScan(Relation rel)
         }
     }
     m_imcstoreDesc = IMCS_HASH_TABLE->GetImcsDesc(RelationGetRelid(m_relation));
+    ImcsAdaptScanInit(this, m_imcstoreDesc);
     m_ctidCol = m_imcstoreDesc->imcsNatts;
     m_deltaScanCurr = 0;
     m_deltaMaskMax = 0;
@@ -783,6 +786,8 @@ void IMCStore::FormLocalCUDeleteMask(_in_ RowGroup* rowgroup, CU* cuPtr, _in_ ui
 CU* IMCStore::GetCUData(CUDesc* cuDescPtr, int colIdx, int valSize, int& slotId)
 {
     int imcsColIdx = m_isCtidCU ? m_ctidCol : m_imcstoreDesc->attmap[colIdx];
+    if (unlikely(u_sess->attr.attr_sql.enable_imcs_adapt && m_partitionWiseScan && m_rowCursorInCU == 0))
+        ImcsAdaptProgress(this, cuDescPtr->cu_id, m_endCUID);
 
     /*
      * we will reset m_PerScanMemCnxt when switch to the next batch of cudesc data.

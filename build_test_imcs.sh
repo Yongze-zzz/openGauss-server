@@ -1,6 +1,6 @@
 #!/bin/bash
-# Usage: ./build_test_imcs.sh build|init|configure|start|all
-# all: build, install, initialize the data directory, and start the database.
+# Usage: ./build_test_imcs.sh build|install|init|configure|start
+# build is compile-only. Installation and database actions are separate, explicit steps.
 
 source_dir=${SOURCE_DIR:-$(cd "$(dirname "$0")" && pwd -P)}
 build_dir=${BUILD_DIR:-$source_dir/tmp_build}
@@ -49,12 +49,32 @@ build() {
         -DENABLE_HTAP=ON -DENABLE_NUMA=ON || return
     "${CMAKE_BIN:-cmake}" --build "$build_dir" --parallel "$jobs" || return
 
-    # Stop this instance before replacing its installed binaries and libraries.
-    if [[ -x $ctl ]]; then
-        stop || return
+    echo "Compile-only complete: $build_dir (nothing installed; database untouched)"
+}
+
+install() {
+    [[ ${CONFIRM_INSTALL:-} == YES ]] || {
+        echo 'INSTALL writes binaries/libraries to INSTALL_DIR. Set CONFIRM_INSTALL=YES explicitly.' >&2; return 1;
+    }
+    if [[ -x $ctl ]] && "$ctl" status -D "$pgdata" >/dev/null 2>&1; then
+        echo 'Target database is running. Stop it manually before installation; this script will not stop it.' >&2
+        return 1
+    fi
+    # Rebuild all targets with the same headers before installing plugins and engine.
+    build || return
+    if [[ -x $ctl ]] && "$ctl" status -D "$pgdata" >/dev/null 2>&1; then
+        echo 'Database became active; installation refused.' >&2; return 1
     fi
     "${CMAKE_BIN:-cmake}" --install "$build_dir" || return
-    echo "Installed in $install_dir"
+    echo "Installed in $install_dir; no database was started or stopped."
+}
+
+database_action_guard() {
+    [[ ${CONFIRM_DATABASE_ACTION:-} == YES ]] || {
+        echo 'Legacy database action may initialize, replace configuration, or restart PGDATA.' >&2
+        echo 'Use explicit manual gs_ctl commands, or set CONFIRM_DATABASE_ACTION=YES deliberately.' >&2
+        return 1
+    }
 }
 
 init() {
@@ -62,12 +82,14 @@ init() {
         echo "Already initialized: $pgdata"
         return
     fi
+    database_action_guard || return
     # Let gs_initdb prompt for the administrator password.
     "$install_dir/bin/gs_initdb" -D "$pgdata" --nodename=imcs_wise \
         -E UTF8 --locale=C -W
 }
 
 configure() {
+    database_action_guard || return
     local node_name backup stream_attr
     [[ $dop =~ ^[1-9][0-9]*$ && $dop -gt 1 ]] ||
         { echo 'DOP must be an integer greater than 1.' >&2; return 1; }
@@ -99,6 +121,7 @@ configure() {
 }
 
 start() {
+    database_action_guard || return
     local exists
     local launcher=()
     if [[ ${#numa_args[@]} -gt 0 ]]; then
@@ -129,24 +152,20 @@ SQL
 }
 
 case "${1:---help}" in
-    build) build ;;
+    build|compile) build ;;
+    install) install ;;
     init) init ;;
     configure) configure ;;
     start) start ;;
-    all) build && init && start ;;
+    all) echo 'all is disabled: use separate build, explicit install and manual database commands.' >&2; exit 1 ;;
     -h|--help)
-        echo "Usage: $0 build|init|configure|start|all"
-        echo 'build: compile and install; init: gs_initdb; start: start/restart and create DB_NAME.'
-        echo 'configure: back up and replace postgresql.conf from REFERENCE_CONF, without restarting.'
-        echo 'all: build -> init -> start. Initialization prompts for an administrator password.'
-        echo 'Defaults: PGDATA=/mnt/nvme1p1/gauss PORT=19999 DB_NAME=tpch JOBS=8 DOP=192'
-        echo 'REFERENCE_CONF defaults to config/imcs_reference.conf (the data instance baseline).'
-        echo 'All baseline settings are retained except PORT, the target node name, and Stream sizing.'
-        echo 'THREAD_POOL_STREAM_ATTR defaults to "DOP * 5,0.2"; query DOP is set by run_imcs_queries.sh.'
-        echo 'NUMACTL_ARGS defaults to "--physcpubind=0-191 --membind=0-7"; set it to empty to disable.'
-        echo 'Changing DOP/NUMACTL_ARGS for an experiment requires start and then IMCS populate again.'
-        echo 'Paths: SOURCE_DIR, BUILD_DIR, INSTALL_DIR, BINARYLIBS, GCC_PATH.'
-        echo 'prepare_tpch_imcs.sh still uses the parent shell PATH or GSQL_BIN.'
+        echo "Usage: $0 build|install|init|configure|start"
+        echo 'build/compile: configure and compile ALL targets only; no install, stop, start or PGDATA changes.'
+        echo 'install: requires CONFIRM_INSTALL=YES and an already stopped target instance; rebuilds all targets then installs.'
+        echo 'init/configure/start: legacy actions require CONFIRM_DATABASE_ACTION=YES; start can STOP the instance and configure replaces its configuration after backup.'
+        echo 'Prefer manual gs_ctl stop/start and explicit gs_guc commands from docs/design/imcs_adaptive_numa.md.'
+        echo 'all is disabled. Existing PGDATA is never deleted or reinitialized.'
+        echo 'Paths: SOURCE_DIR BUILD_DIR INSTALL_DIR BINARYLIBS GCC_PATH; JOBS=8.'
         ;;
     *) echo "Unknown step: $1" >&2; exit 1 ;;
 esac

@@ -224,6 +224,7 @@ void CU::Reset()
     imcsDesc = NULL;
     m_partitionWiseBuffer = NULL;
     m_partitionWiseBufferSize = 0;
+    m_partitionWiseAccounted = false;
 #endif
 }
 
@@ -1715,6 +1716,10 @@ void CU::FreeCompressBuf()
 
 void CU::FreeSrcBuf()
 {
+#ifdef ENABLE_HTAP
+    // mmap-backed source/offset buffers must never be passed to free().
+    FreePartitionWiseBuffer();
+#endif
     if (m_srcBuf) {
         CStoreMemAlloc::Pfree(m_srcBuf, !m_inCUCache);
     }
@@ -1872,6 +1877,21 @@ int CU::GetCurScanPos(int rowCursorInCU)
 void IMCSDesc::Init(Relation rel, int2vector* imcstoreAttsNum, int imcstoreNatts, bool useShareMemroy)
 {
     dataNumaNode = -1;
+    numaGroup = InvalidOid;
+    numaOrdinal = -1;
+    numaPartitions = 0;
+    numaGroupMembers = 0;
+    pg_atomic_init_u32(&adaptDisabled, 0);
+    pg_atomic_init_u32(&adaptMoving, 0);
+    pg_atomic_init_u32(&adaptActiveScans, 0);
+    numaRelNode = *(RelFileNodeOld*)&rel->rd_node;
+    pg_atomic_init_u32(&currentNumaNode, UINT_MAX);
+    pg_atomic_init_u64(&numaGeneration, (uint64)GetCurrentTimestamp());
+    pg_atomic_init_u64(&numaMappedBytes, 0);
+    pg_atomic_init_u64(&adaptCpuNs, 0);
+    pg_atomic_init_u64(&adaptLocalBytes, 0);
+    pg_atomic_init_u64(&adaptInvalidSamples, 0);
+    pg_atomic_init_u64(&adaptLeaseUntilUs, 0);
     relOid = RelationGetRelid(rel);
     relfilenode = RelationGetRelFileNode(rel);
     imcsAttsNum = int2vectorCopy(imcstoreAttsNum);

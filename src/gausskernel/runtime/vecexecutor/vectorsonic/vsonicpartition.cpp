@@ -36,7 +36,8 @@
 #include "vectorsonic/vsonicfixlen.h"
 #include <algorithm>
 
-SonicHashPartition::SonicHashPartition(const char* cxtname, uint16 cols, int64 workMem, bool useRack) : m_cols(cols)
+SonicHashPartition::SonicHashPartition(const char* cxtname, uint16 cols, int64 workMem, bool useRack, bool shared)
+    : m_cols(cols)
 {
     m_rows = 0;
     m_size = 0;
@@ -47,15 +48,18 @@ SonicHashPartition::SonicHashPartition(const char* cxtname, uint16 cols, int64 w
         ALLOCSET_DEFAULT_MINSIZE,
         ALLOCSET_DEFAULT_INITSIZE,
         ALLOCSET_DEFAULT_MAXSIZE,
-        useRack ? RACK_CONTEXT : STANDARD_CONTEXT,
+        shared ? SHARED_CONTEXT : (useRack ? RACK_CONTEXT : STANDARD_CONTEXT),
         workMem);
 
     m_status = partitionStatusInitial;
 }
 
-SonicHashMemPartition::SonicHashMemPartition(const char* cxtname, bool hasHash, TupleDesc tupleDesc, int64 workMem)
-    : SonicHashPartition(cxtname, tupleDesc->natts, workMem, EnableBorrowWorkMemory())
+SonicHashMemPartition::SonicHashMemPartition(const char* cxtname, bool hasHash, TupleDesc tupleDesc, int64 workMem,
+    uint32 atomCapacity, bool shared)
+    : SonicHashPartition(cxtname, tupleDesc->natts, workMem, !shared && EnableBorrowWorkMemory(), shared)
 {
+    m_atomCapacity = atomCapacity;
+    Assert(atomCapacity >= 1024 && (atomCapacity & (atomCapacity - 1)) == 0);
     MemoryContext old_ctx = MemoryContextSwitchTo(m_context);
     m_data = (SonicDatumArray**)palloc0(sizeof(SonicDatumArray*) * m_cols);
     m_segHashTable = false;
@@ -72,7 +76,7 @@ SonicHashMemPartition::SonicHashMemPartition(const char* cxtname, bool hasHash, 
         /* init m_hash to store the hash value */
         DatumDesc* desc = (DatumDesc*)palloc0(sizeof(DatumDesc));
         getDataDesc(desc, 4, NULL, false);
-        m_hash = New(m_context) SonicIntTemplateDatumArray<uint32>(m_context, INIT_DATUM_ARRAY_SIZE, false, desc);
+        m_hash = New(m_context) SonicIntTemplateDatumArray<uint32>(m_context, m_atomCapacity, false, desc);
     }
 
     (void)MemoryContextSwitchTo(old_ctx);
@@ -89,23 +93,23 @@ void SonicHashMemPartition::init(uint16 colIdx, DatumDesc* desc)
 
     switch (desc->dataType) {
         case SONIC_INT_TYPE:
-            m_data[colIdx] = AllocateIntArray(m_context, m_context, INIT_DATUM_ARRAY_SIZE, true, desc);
+            m_data[colIdx] = AllocateIntArray(m_context, m_context, m_atomCapacity, true, desc);
             break;
 
         case SONIC_NUMERIC_COMPRESS_TYPE:
-            m_data[colIdx] = New(m_context) SonicNumericDatumArray(m_context, INIT_DATUM_ARRAY_SIZE, true, desc);
+            m_data[colIdx] = New(m_context) SonicNumericDatumArray(m_context, m_atomCapacity, true, desc);
             break;
 
         case SONIC_VAR_TYPE:
-            m_data[colIdx] = New(m_context) SonicStackEncodingDatumArray(m_context, INIT_DATUM_ARRAY_SIZE, true, desc);
+            m_data[colIdx] = New(m_context) SonicStackEncodingDatumArray(m_context, m_atomCapacity, true, desc);
             break;
 
         case SONIC_FIXLEN_TYPE:
-            m_data[colIdx] = New(m_context) SonicFixLenDatumArray(m_context, INIT_DATUM_ARRAY_SIZE, true, desc);
+            m_data[colIdx] = New(m_context) SonicFixLenDatumArray(m_context, m_atomCapacity, true, desc);
             break;
 
         case SONIC_CHAR_DIC_TYPE:
-            m_data[colIdx] = New(m_context) SonicCharDatumArray(m_context, INIT_DATUM_ARRAY_SIZE, true, desc);
+            m_data[colIdx] = New(m_context) SonicCharDatumArray(m_context, m_atomCapacity, true, desc);
             break;
 
         default:
@@ -132,6 +136,110 @@ void SonicHashMemPartition::putBatch(VectorBatch* batch)
     m_rows += batch->m_rows;
 
     Assert(isValid());
+}
+
+/*
+ * @Description: Append the rows of one batch into multiple radix partitions.
+ * 	The caller has already computed the partition index of each row. Rows of
+ * 	one partition are gathered into a temporary array per column and inserted
+ * 	with a single putArray() call, avoiding one virtual call per row.
+ * @in partitions - destination memory partitions.
+ * @in numParts - number of destination partitions.
+ * @in batch - source vector batch.
+ * @in partIdx - partition index of every row in batch.
+ * @in hashVals - hash value of every row, NULL for simple join keys.
+ */
+void SonicHashMemPartition::putBatchByPartition(SonicHashMemPartition** partitions, uint32 numParts,
+    VectorBatch* batch, uint32* partIdx, uint32* hashVals)
+{
+    Assert(partitions != NULL);
+    Assert(batch != NULL);
+    Assert(partIdx != NULL);
+    Assert(numParts > 0);
+
+    int nrows = batch->m_rows;
+    if (nrows <= 0) {
+        return;
+    }
+
+    uint32* counts = (uint32*)palloc0(sizeof(uint32) * numParts);
+    uint32* starts = (uint32*)palloc(sizeof(uint32) * numParts);
+
+    for (int i = 0; i < nrows; ++i) {
+        Assert(partIdx[i] < numParts);
+        counts[partIdx[i]]++;
+    }
+
+    uint32 offset = 0;
+    for (uint32 p = 0; p < numParts; ++p) {
+        starts[p] = offset;
+        offset += counts[p];
+    }
+
+    ScalarValue* tmpVals = (ScalarValue*)palloc(sizeof(ScalarValue) * nrows);
+    uint8* tmpFlags = (uint8*)palloc(sizeof(uint8) * nrows);
+
+    for (int col = 0; col < batch->m_cols; ++col) {
+        ScalarVector* vec = &batch->m_arr[col];
+        uint32* cursor = (uint32*)palloc(sizeof(uint32) * numParts);
+        for (uint32 p = 0; p < numParts; ++p) {
+            cursor[p] = starts[p];
+        }
+
+        for (int i = 0; i < nrows; ++i) {
+            uint32 p = partIdx[i];
+            uint32 pos = cursor[p]++;
+            tmpVals[pos] = vec->m_vals[i];
+            tmpFlags[pos] = vec->m_flag[i];
+        }
+
+        for (uint32 p = 0; p < numParts; ++p) {
+            if (counts[p] == 0) {
+                continue;
+            }
+            partitions[p]->m_data[col]->putArray(&tmpVals[starts[p]], &tmpFlags[starts[p]], counts[p]);
+        }
+
+        pfree(cursor);
+    }
+
+    pfree(tmpVals);
+    pfree(tmpFlags);
+
+    if (hashVals != NULL) {
+        uint32* tmpHash = (uint32*)palloc(sizeof(uint32) * nrows);
+        uint32* cursor = (uint32*)palloc(sizeof(uint32) * numParts);
+        for (uint32 p = 0; p < numParts; ++p) {
+            cursor[p] = starts[p];
+        }
+
+        for (int i = 0; i < nrows; ++i) {
+            uint32 p = partIdx[i];
+            tmpHash[cursor[p]++] = hashVals[i];
+        }
+
+        for (uint32 p = 0; p < numParts; ++p) {
+            if (counts[p] == 0) {
+                continue;
+            }
+            partitions[p]->putHash(&tmpHash[starts[p]], counts[p]);
+        }
+
+        pfree(tmpHash);
+        pfree(cursor);
+    }
+
+    for (uint32 p = 0; p < numParts; ++p) {
+        /* Radix partitions are created on first use; empty destinations may
+         * still be NULL when the partition count exceeds this batch's rows. */
+        if (counts[p] != 0) {
+            Assert(partitions[p] != NULL);
+            partitions[p]->m_rows += counts[p];
+        }
+    }
+
+    pfree(counts);
+    pfree(starts);
 }
 
 /*

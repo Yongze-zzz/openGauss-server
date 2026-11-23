@@ -184,6 +184,8 @@ public:
     /* operate cache block */
     void InitCacheBlockTag(CacheTag* cacheTag, int32 type, const void* key, int32 length) const;
     CacheSlotId_t FindCacheBlock(CacheTag* cacheTag, bool first_enter_block);
+    CacheSlotId_t PinReadyCacheBlockForPlacement(CacheTag* cacheTag);
+    void UnpinCacheBlockForPlacement(CacheSlotId_t slotId);
     void InvalidateCacheBlock(CacheTag* cacheTag);
     void DeleteCacheBlock(CacheTag* cacheTag);
     CacheSlotId_t ReserveCacheBlock(CacheTag* cacheTag, int size, bool& hasFound);
@@ -206,6 +208,7 @@ public:
 
     /* compress lock */
     void AcquireCompressLock(CacheSlotId_t slotId);
+    bool TryAcquireCompressLock(CacheSlotId_t slotId);
     void ReleaseCompressLock(CacheSlotId_t slotId);
 
     /* ring strategy, not used for now */

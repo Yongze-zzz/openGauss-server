@@ -494,6 +494,8 @@ static PartIterator* _copyPartIterator(const PartIterator* from)
     COPY_SCALAR_FIELD(itrs);
     COPY_SCALAR_FIELD(direction);
     COPY_NODE_FIELD(param);
+    COPY_SCALAR_FIELD(wholePartitionPerWorker);
+    COPY_SCALAR_FIELD(chipletJoinOwner);
 
     return newnode;
 }
@@ -2081,6 +2083,8 @@ static VecPartIterator* _copyVecPartIterator(const VecPartIterator* from)
     COPY_SCALAR_FIELD(itrs);
     COPY_SCALAR_FIELD(direction);
     COPY_NODE_FIELD(param);
+    COPY_SCALAR_FIELD(wholePartitionPerWorker);
+    COPY_SCALAR_FIELD(chipletJoinOwner);
 
     return newnode;
 }
@@ -2318,6 +2322,7 @@ static VecStream* _copyVecStream(const VecStream* from)
     COPY_SCALAR_FIELD(stream_level);
     COPY_NODE_FIELD(origin_consumer_nodes);
     COPY_SCALAR_FIELD(is_recursive_local);
+    COPY_SCALAR_FIELD(chipletOwnerHandoff);
 #ifdef USE_SPQ
     COPY_SCALAR_FIELD(streamID);
 #endif
@@ -2445,6 +2450,7 @@ static Stream* _copyStream(const Stream* from)
     COPY_SCALAR_FIELD(stream_level);
     COPY_NODE_FIELD(origin_consumer_nodes);
     COPY_SCALAR_FIELD(is_recursive_local);
+    COPY_SCALAR_FIELD(chipletOwnerHandoff);
 #ifdef USE_SPQ
     COPY_SCALAR_FIELD(streamID);
 #endif

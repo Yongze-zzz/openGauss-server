@@ -60,10 +60,23 @@ extern void VecCacheTraceEnter(PlanState* node);
 extern void VecCacheTraceLeave(PlanState* node);
 extern void VecCacheTraceFlush();
 extern void VecCacheTraceDiscard();
+struct VecCacheTraceCounters {
+    uint64 instructions;
+    uint64 misses;
+    uint64 runningNs;
+    uint64 enabledNs;
+};
+extern bool VecCacheTraceSnapshot(VecCacheTraceCounters* counters, uint64* cycles = NULL, uint64* stalls = NULL);
 extern bool VecEngineProfileEnabled();
 extern uint64 VecEngineProfileEnter(PlanState* node, int* depth, int* cpu_id);
 extern void VecEngineProfileLeave(PlanState* node, VectorBatch* result, uint64 start_time, int depth, int cpu_id);
 extern void VecEngineProfileFlush();
 extern void VecEngineProfileDiscard();
 
+extern void VecCacheTraceReadCounters(uint64* started, uint64* written, uint64* startFailed,
+    uint64* perfUnavailable, uint64* writeFailed, uint64* discarded);
+extern void RhjTrackEnter(PlanState* node);
+extern void RhjTrackLeave(PlanState* node);
+extern void RhjTrackReset();
+extern void RhjReadCounters(uint64* builds, uint64* cacheBuilds, uint64* chipletBuilds, uint64* partitions, uint64* targetMisses);
 #endif /* VECEXECUTOR_H_ */

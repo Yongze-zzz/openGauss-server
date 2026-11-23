@@ -41,8 +41,8 @@ run_query() {
         echo 'SHOW codegen_cost_threshold;'
         echo 'SET enable_imcsscan = on;'
         echo 'SET enable_cstore_partition_lane_scan = off;'
-        echo 'SET enable_intra_operator_data_access = off;'
-        echo 'SET enable_inter_operator_data_access = off;'
+        echo 'SET enable_intra_operator_data_access = on;'
+        echo 'SET enable_inter_operator_data_access = on;'
         echo "SET query_dop = $dop;"
         echo 'SET enable_imcs_partition_scan = on;'
         echo "SET enable_numa_aware_partition_scan = $numa;"

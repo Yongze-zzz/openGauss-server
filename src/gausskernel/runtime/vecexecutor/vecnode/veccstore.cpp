@@ -60,6 +60,7 @@
 #include "optimizer/pruning.h"
 
 #ifdef ENABLE_HTAP
+#include "vecexecutor/vec_cache_coord.h"
 #include "vecexecutor/vecnodeimcstorescan.h"
 #endif /* ENABLE_HTAP */
 
@@ -350,7 +351,14 @@ restart:
     node->ps.ps_ProjInfo->pi_exprContext->current_row = 0;
 
     if (!node->isSampleScan) {
-        node->m_CStore->RunScan(node, p_scan_batch);
+#ifdef ENABLE_HTAP
+        if (unlikely(IsA(node, IMCStoreScanState) && VecCacheCoordHarmfulEnabled())) {
+            VecCacheCoordRunHarmfulPhase(HarmfulCachePhase::Scan, [&] { node->m_CStore->RunScan(node, p_scan_batch); });
+        } else
+#endif
+        {
+            node->m_CStore->RunScan(node, p_scan_batch);
+        }
     } else {
         /*
          * Sample scan for column table.

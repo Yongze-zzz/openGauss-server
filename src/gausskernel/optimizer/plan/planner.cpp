@@ -65,6 +65,10 @@
 #include "securec.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
+#ifdef ENABLE_HTAP
+#include "access/htap/imcs_hash_table.h"
+#include "utils/partitionmap.h"
+#endif
 #ifdef PGXC
 #include "commands/prepare.h"
 #include "pgxc/pgxc.h"
@@ -283,6 +287,9 @@ static bool vector_engine_walker(Plan* result_plan, bool check_rescan);
 static Plan* fallback_plan(Plan* result_plan);
 static Plan* vectorize_plan(Plan* result_plan, bool ignore_remotequery, bool forceVectorEngine);
 static Plan* build_vector_plan(Plan* plan);
+#if defined(ENABLE_HTAP) && !defined(ENABLE_MULTIPLE_NODES)
+static void place_imcs_chiplet_joins(Plan* plan, List* rtable, int mode);
+#endif
 static Plan* mark_windowagg_stream(
     PlannerInfo* root, Plan* plan, List* tlist, WindowClause* wc, List* pathkeys, WindowLists* wflists);
 static uint32 get_hashagg_skew(AggSkewInfo* skew_info, List* distribute_keys);
@@ -746,6 +753,14 @@ PlannedStmt* standard_planner(Query* parse, int cursorOptions, ParamListInfo bou
 
     top_plan = set_plan_references(root, top_plan);
     delete_redundant_streams_of_remotequery((RemoteQuery *)top_plan);
+#if defined(ENABLE_HTAP) && !defined(ENABLE_MULTIPLE_NODES)
+    const auto& chiplet = u_sess->attr.attr_sql;
+    if (chiplet.imcs_chiplet_exchange_mode > 0 && chiplet.enable_imcs_nps &&
+        chiplet.enable_imcs_shared_sonic_agg && !chiplet.enable_imcs_adapt &&
+        !chiplet.enable_imcs_local_task_queue && !chiplet.enable_imcs_stream_consumer_placement &&
+        IS_SINGLE_NODE && !IS_SPQ_RUNNING && !ENABLE_DMS && !ENABLE_DSS)
+        place_imcs_chiplet_joins(top_plan, glob->finalrtable, chiplet.imcs_chiplet_exchange_mode);
+#endif
 
     /*
      * just for cooperation analysis on client cluster,
@@ -10421,7 +10436,6 @@ static Plan* fallback_plan(Plan* result_plan)
             break;
 
         case T_Limit:
-        case T_PartIterator:
         case T_SetOp:
         case T_Group:
         case T_Unique:
@@ -10443,6 +10457,14 @@ static Plan* fallback_plan(Plan* result_plan)
         case T_RowToVec:
         case T_VecRemoteQuery:
             result_plan->lefttree = fallback_plan(result_plan->lefttree);
+            break;
+        case T_PartIterator:
+            if (((PartIterator*)result_plan)->wholePartitionPerWorker) {
+                result_plan->lefttree = build_vector_plan(result_plan->lefttree);
+                result_plan = (Plan*)make_vectorow(build_vector_plan(result_plan));
+            } else {
+                result_plan->lefttree = fallback_plan(result_plan->lefttree);
+            }
             break;
 
         case T_MergeJoin:
@@ -11930,6 +11952,355 @@ bool is_agg_distribution_compalible_with_child(Distribution* aggDistribution, Di
     return false;
 }
 
+#if defined(ENABLE_HTAP) && !defined(ENABLE_MULTIPLE_NODES)
+/* Match the join's input column to a real hash-partition key after setrefs. */
+static Var* imcs_chiplet_key(Plan* plan, AttrNumber column)
+{
+    TargetEntry* entry = get_tle_by_resno(plan->targetlist, column);
+    return entry != NULL && IsA(entry->expr, Var) ? (Var*)entry->expr : NULL;
+}
+
+static bool imcs_chiplet_exchange_input(Plan* plan, int dop, bool allowBroadcast = false)
+{
+    if (plan == NULL || !IsA(plan, VecStream) || plan->extParam != NULL || plan->initPlan != NIL)
+        return false;
+    Stream* stream = (Stream*)plan;
+    bool redistribute = stream->type == STREAM_REDISTRIBUTE && stream->smpDesc.distriType == LOCAL_DISTRIBUTE;
+    bool broadcast = allowBroadcast && stream->type == STREAM_BROADCAST &&
+        stream->smpDesc.distriType == LOCAL_BROADCAST;
+    return (redistribute || broadcast) &&
+        stream->smpDesc.producerDop == dop && stream->smpDesc.consumerDop == dop &&
+        stream->sort == NULL && !stream->is_sorted && !stream->is_dummy && !stream->is_recursive_local &&
+        stream->skew_list == NIL && outerPlan(plan) != NULL;
+}
+
+static Oid imcs_chiplet_relation(Plan* iterator, AttrNumber column, Oid keyType, List* rtable, AttrNumber* keyColumn)
+{
+    if (iterator == NULL || !IsA(iterator, VecPartIterator) || iterator->extParam != NULL ||
+        outerPlan(iterator) == NULL ||
+        !IsA(outerPlan(iterator), IMCStoreScan))
+        return InvalidOid;
+    IMCStoreScan* scan = (IMCStoreScan*)outerPlan(iterator);
+    Var* key = imcs_chiplet_key(iterator, column);
+    if (key == NULL || key->varno != scan->scanrelid || key->vartype != keyType || key->varattno <= 0 ||
+        scan->partition_iterator_elimination || scan->tablesample != NULL || scan->isShareScan ||
+        ((VecPartIterator*)iterator)->direction != ForwardScanDirection)
+        return InvalidOid;
+    RangeTblEntry* rte = rt_fetch(scan->scanrelid, rtable);
+    if (rte->rtekind != RTE_RELATION)
+        return InvalidOid;
+    *keyColumn = key->varattno;
+    return rte->relid;
+}
+
+static bool imcs_chiplet_matching_buckets(const Relation a, AttrNumber aKey,
+    const Relation b, AttrNumber bKey, Oid keyType)
+{
+    if (!RelationIsPartitioned(a) || !RelationIsPartitioned(b) || RelationIsSubPartitioned(a) ||
+        RelationIsSubPartitioned(b) || a->partMap == NULL || b->partMap == NULL ||
+        !PartitionMapIsHash(a->partMap) || !PartitionMapIsHash(b->partMap))
+        return false;
+    const auto* left = (const HashPartitionMap*)a->partMap;
+    const auto* right = (const HashPartitionMap*)b->partMap;
+    if (left->hashElementsNum != right->hashElementsNum || left->base.partitionKey->dim1 != 1 ||
+        right->base.partitionKey->dim1 != 1 || left->base.partitionKey->values[0] != aKey ||
+        right->base.partitionKey->values[0] != bKey ||
+        left->base.partitionKeyDataType[0] != keyType || right->base.partitionKeyDataType[0] != keyType)
+        return false;
+    for (int i = 0; i < left->hashElementsNum; ++i) {
+        const auto& x = left->hashElements[i];
+        const auto& y = right->hashElements[i];
+        IMCSDesc* leftDesc = IMCS_HASH_TABLE->GetImcsDesc(x.partitionOid);
+        IMCSDesc* rightDesc = IMCS_HASH_TABLE->GetImcsDesc(y.partitionOid);
+        if (leftDesc == NULL || rightDesc == NULL || !OidIsValid(leftDesc->numaGroup) ||
+            leftDesc->numaGroup != rightDesc->numaGroup || leftDesc->dataNumaNode != rightDesc->dataNumaNode ||
+            leftDesc->numaOrdinal != i || rightDesc->numaOrdinal != i || !equal(x.boundary[0], y.boundary[0]))
+            return false;
+    }
+    return true;
+}
+
+static bool imcs_chiplet_inputs_aligned(Plan* left, AttrNumber leftColumn, Plan* right, AttrNumber rightColumn,
+    Oid keyType, List* rtable)
+{
+    AttrNumber aKey = InvalidAttrNumber, bKey = InvalidAttrNumber;
+    Oid aId = imcs_chiplet_relation(left, leftColumn, keyType, rtable, &aKey);
+    Oid bId = imcs_chiplet_relation(right, rightColumn, keyType, rtable, &bKey);
+    if (!OidIsValid(aId) || !OidIsValid(bId))
+        return false;
+    Relation a = heap_open(aId, NoLock);
+    Relation b = heap_open(bId, NoLock);
+    bool matched = imcs_chiplet_matching_buckets(a, aKey, b, bKey, keyType);
+    heap_close(b, NoLock);
+    heap_close(a, NoLock);
+    return matched;
+}
+
+static void imcs_chiplet_assign_bucket_owner(Plan* input)
+{
+    VecPartIterator* iterator = (VecPartIterator*)input;
+    iterator->wholePartitionPerWorker = true;
+    iterator->chipletJoinOwner = true;
+}
+
+/* A broadcast build leaves the probe side in its original lane. Its output
+ * can carry the probe's partition key unchanged through an inner join. */
+static bool imcs_chiplet_broadcast_build(Plan* plan, int dop)
+{
+    if (plan == NULL || !IsA(plan, VecHashJoin) || plan->dop != dop || plan->extParam != NULL ||
+        plan->initPlan != NIL || plan->ispwj || plan->filterIndexList != NIL || plan->var_list != NIL ||
+        outerPlan(plan) == NULL || !imcs_chiplet_exchange_input(innerPlan(plan), dop, true))
+        return false;
+    auto* join = (VecHashJoin*)plan;
+    auto* build = (Stream*)innerPlan(plan);
+    return join->join.jointype == JOIN_INNER && !join->rebuildHashTable &&
+        join->join.nulleqqual == NIL && join->join.skewoptimize == SKEW_RES_NONE &&
+        build->type == STREAM_BROADCAST;
+}
+
+static bool imcs_chiplet_place_scan_pair(VecHashJoin* join, int dop, const Var* outerKey, const Var* innerKey,
+    List* rtable, int mode)
+{
+    Plan* plan = &join->join.plan;
+    Plan* left = outerPlan(plan);
+    Plan* right = innerPlan(plan);
+    bool leftExchange = imcs_chiplet_exchange_input(left, dop, true);
+    bool rightExchange = imcs_chiplet_exchange_input(right, dop, true);
+    if ((!leftExchange && !rightExchange) || plan->filterIndexList != NIL || plan->var_list != NIL)
+        return false;
+    if (leftExchange)
+        left = outerPlan(left);
+    if (rightExchange)
+        right = outerPlan(right);
+    Plan* rightScan = right;
+    AttrNumber rightColumn = innerKey->varattno;
+    if (mode >= 4 && left != NULL && !leftExchange && rightExchange &&
+        ((Stream*)innerPlan(plan))->type == STREAM_BROADCAST && IsA(left, VecPartIterator) &&
+        join->join.jointype == JOIN_INNER && imcs_chiplet_broadcast_build(right, dop)) {
+        Var* key = imcs_chiplet_key(right, rightColumn);
+        if (key == NULL || key->varno != OUTER_VAR || key->vartype != innerKey->vartype)
+            return false;
+        rightColumn = key->varattno;
+        rightScan = outerPlan(right);
+    }
+    if (!imcs_chiplet_inputs_aligned(left, outerKey->varattno, rightScan, rightColumn,
+        outerKey->vartype, rtable))
+        return false;
+
+    imcs_chiplet_assign_bucket_owner(left);
+    imcs_chiplet_assign_bucket_owner(rightScan);
+    plan->lefttree = left;
+    plan->righttree = right;
+    join->streamBothSides = rightScan != right;
+    return true;
+}
+
+static Node* imcs_chiplet_swap_join_var(Node* node, void* context)
+{
+    if (node == NULL)
+        return NULL;
+    if (IsA(node, Var)) {
+        Var* var = (Var*)copyObject(node);
+        if (var->varno == OUTER_VAR)
+            var->varno = INNER_VAR;
+        else if (var->varno == INNER_VAR)
+            var->varno = OUTER_VAR;
+        return (Node*)var;
+    }
+    return expression_tree_mutator(node, imcs_chiplet_swap_join_var, context);
+}
+
+static void imcs_chiplet_join_handoff(VecHashJoin* join, int dop, List* rtable, int mode)
+{
+    Plan* plan = &join->join.plan;
+    JoinType kind = join->join.jointype;
+    if (dop <= 1 || !join->isSonicHash ||
+        (kind != JOIN_INNER && kind != JOIN_SEMI && kind != JOIN_RIGHT_SEMI) || join->rebuildHashTable ||
+        plan->ispwj || plan->extParam != NULL || join->join.nulleqqual != NIL ||
+        join->join.skewoptimize != SKEW_RES_NONE || list_length(join->hashclauses) != 1)
+        return;
+    Node* clause = (Node*)linitial(join->hashclauses);
+    if (!IsA(clause, OpExpr))
+        return;
+    OpExpr* equalKey = (OpExpr*)clause;
+    if (list_length(equalKey->args) != 2 || !IsA(linitial(equalKey->args), Var) || !IsA(lsecond(equalKey->args), Var))
+        return;
+    Var* leftKey = (Var*)linitial(equalKey->args);
+    Var* rightKey = (Var*)lsecond(equalKey->args);
+    if (leftKey->varno != OUTER_VAR || rightKey->varno != INNER_VAR ||
+        leftKey->vartype != rightKey->vartype ||
+        !((equalKey->opno == INT8EQOID && leftKey->vartype == INT8OID) ||
+            (equalKey->opno == INT4EQOID && leftKey->vartype == INT4OID)))
+        return;
+
+    if (imcs_chiplet_place_scan_pair(join, dop, leftKey, rightKey, rtable, mode) ||
+        kind != JOIN_INNER || !imcs_chiplet_exchange_input(outerPlan(plan), dop) ||
+        !imcs_chiplet_exchange_input(innerPlan(plan), dop))
+        return;
+
+    bool aggregateOuter = IsA(outerPlan(outerPlan(plan)), VecAgg);
+    Plan* aggregateStream = aggregateOuter ? outerPlan(plan) : innerPlan(plan);
+    Plan* scanStream = aggregateOuter ? innerPlan(plan) : outerPlan(plan);
+    Plan* aggregate = outerPlan(aggregateStream);
+    Plan* scan = outerPlan(scanStream);
+    if (!IsA(aggregate, VecAgg) || !IsA(scan, VecPartIterator) || aggregate->plan_rows * 8 > scan->plan_rows)
+        return;
+    VecAgg* agg = (VecAgg*)aggregate;
+    Plan* input = outerPlan(aggregate);
+    AttrNumber groupColumn = aggregateOuter ? leftKey->varattno : rightKey->varattno;
+    AttrNumber scanColumn = aggregateOuter ? rightKey->varattno : leftKey->varattno;
+    Var* groupKey = imcs_chiplet_key(aggregate, groupColumn);
+    if (input == NULL || !IsA(input, VecPartIterator) || !((VecPartIterator*)input)->wholePartitionPerWorker ||
+        !agg->is_sonichash || !agg->single_node || agg->numCols != 1 || groupKey == NULL ||
+        groupKey->varno != OUTER_VAR || groupKey->varattno != agg->grpColIdx[0])
+        return;
+
+    if (!imcs_chiplet_inputs_aligned(input, groupKey->varattno, scan, scanColumn, groupKey->vartype, rtable))
+        return;
+
+    imcs_chiplet_assign_bucket_owner(scan);
+    imcs_chiplet_assign_bucket_owner(input);
+    join->streamBothSides = false;
+    bool canSwap = plan->filterIndexList == NIL && plan->var_list == NIL;
+    bool fused = mode >= 3 && canSwap;
+    Plan* aggregateInput = fused ? aggregate : aggregateStream;
+    if (!fused)
+        ((Stream*)aggregateStream)->chipletOwnerHandoff = true;
+    plan->lefttree = aggregateOuter ? aggregateInput : scan;
+    plan->righttree = aggregateOuter ? scan : aggregateInput;
+
+    /* The enclosing Stream republishes the join output whenever a parent
+     * needs a distribution other than the physical bucket ownership. */
+    if (mode >= 2 && aggregateOuter && canSwap) {
+        plan->lefttree = scan;
+        plan->righttree = aggregateInput;
+        plan->targetlist = (List*)imcs_chiplet_swap_join_var((Node*)plan->targetlist, NULL);
+        plan->qual = (List*)imcs_chiplet_swap_join_var((Node*)plan->qual, NULL);
+        join->join.joinqual = (List*)imcs_chiplet_swap_join_var((Node*)join->join.joinqual, NULL);
+        OpExpr* swapped = (OpExpr*)copyObject(equalKey);
+        swapped->args = list_make2(imcs_chiplet_swap_join_var((Node*)rightKey, NULL),
+            imcs_chiplet_swap_join_var((Node*)leftKey, NULL));
+        join->hashclauses = list_make1(swapped);
+        join->join.inner_unique = true;
+    }
+}
+
+/* These operators stay inside the same Stream lane. The enclosing exchange
+ * decouples the changed bucket placement from every other parallel pipeline. */
+static VecHashJoin* imcs_chiplet_exchange_join(Plan* plan, int dop)
+{
+    while (plan != NULL && plan->dop == dop && plan->extParam == NULL && plan->initPlan == NIL) {
+        if (IsA(plan, VecHashJoin))
+            return (VecHashJoin*)plan;
+        if (IsA(plan, VecSubqueryScan))
+            plan = ((SubqueryScan*)plan)->subplan;
+        else if (IsA(plan, VecAgg) && ((VecAgg*)plan)->aggstrategy != AGG_SORTED)
+            plan = outerPlan(plan);
+        else
+            break;
+    }
+    return NULL;
+}
+
+/* A small independent scan can use fewer broadcast producers without
+ * changing the receiver lanes or the co-partitioned side of the join. */
+static void imcs_chiplet_limit_broadcast(Plan* pipeline, int dop)
+{
+    constexpr int maxProducers = 12;
+    if (dop <= maxProducers || !imcs_chiplet_broadcast_build(pipeline, dop))
+        return;
+    Stream* exchange = (Stream*)innerPlan(pipeline);
+    Plan* scanPlan = outerPlan(exchange);
+    if (!IsA(scanPlan, IMCStoreScan) || scanPlan->dop != dop || scanPlan->ispwj ||
+        scanPlan->extParam != NULL || scanPlan->initPlan != NIL || scanPlan->plan_rows <= 0 ||
+        scanPlan->plan_rows > 2000000 || contain_subplans((Node*)scanPlan->targetlist) ||
+        contain_subplans((Node*)scanPlan->qual) || contain_volatile_functions((Node*)scanPlan->targetlist) ||
+        contain_volatile_functions((Node*)scanPlan->qual))
+        return;
+    IMCStoreScan* scan = (IMCStoreScan*)scanPlan;
+    if (scan->isPartTbl || scan->isShareScan || scan->isAdaptiveScan || scan->tablesample != NULL)
+        return;
+
+    exchange->smpDesc.producerDop = maxProducers;
+}
+
+static void place_imcs_chiplet_joins(Plan* plan, List* rtable, int mode)
+{
+    if (plan == NULL)
+        return;
+    if (IsA(plan, VecStream)) {
+        Stream* stream = (Stream*)plan;
+        if (STREAM_IS_LOCAL_NODE(stream->smpDesc.distriType) && stream->sort == NULL &&
+            !stream->is_recursive_local && !stream->is_sorted) {
+            const int dop = stream->smpDesc.producerDop;
+            VecHashJoin* join = imcs_chiplet_exchange_join(outerPlan(plan), dop);
+            Plan* pipeline = join == NULL ? NULL : &join->join.plan;
+            while (join != NULL) {
+                Plan* joinPlan = &join->join.plan;
+                imcs_chiplet_join_handoff(join, dop, rtable, mode);
+                Plan* probe = outerPlan(joinPlan);
+                if (mode >= 5 && joinPlan != pipeline && probe != NULL && IsA(probe, VecPartIterator) &&
+                    ((VecPartIterator*)probe)->chipletJoinOwner)
+                    imcs_chiplet_limit_broadcast(pipeline, dop);
+                if (mode < 4 || !imcs_chiplet_broadcast_build(joinPlan, dop) || !IsA(probe, VecHashJoin))
+                    break;
+                join = (VecHashJoin*)probe;
+            }
+        }
+    }
+    if (IsA(plan, VecSubqueryScan) || IsA(plan, SubqueryScan))
+        place_imcs_chiplet_joins(((SubqueryScan*)plan)->subplan, rtable, mode);
+    place_imcs_chiplet_joins(outerPlan(plan), rtable, mode);
+    place_imcs_chiplet_joins(innerPlan(plan), rtable, mode);
+}
+
+static Expr* imcs_partition_agg_key(PlannerInfo* root, Plan* input, List* output, List* having,
+    const AggClauseCosts* costs, int numCols, const AttrNumber* cols, const Oid* operators)
+{
+    const auto& sql = u_sess->attr.attr_sql;
+    if (!sql.enable_imcs_shared_sonic_agg || !sql.enable_imcs_nps || sql.enable_imcs_adapt ||
+        sql.enable_imcs_local_task_queue || !IS_SINGLE_NODE || ENABLE_DSS || ENABLE_DMS || IS_SPQ_RUNNING ||
+        root->glob->insideRecursion || root->parse->groupingSets != NIL || root->parse->hasTargetSRFs ||
+        having == NIL || costs == NULL || costs->numOrderedAggs != 0 || costs->exprAggs != NIL ||
+        numCols != 1 || cols == NULL || operators == NULL || operators[0] != INT8EQOID ||
+        input->dop <= 1 || input->ispwj ||
+        !IsA(input, PartIterator) || outerPlan(input) == NULL || !IsA(outerPlan(input), IMCStoreScan))
+        return NULL;
+
+    IMCStoreScan* scan = (IMCStoreScan*)outerPlan(input);
+    if (scan->partition_iterator_elimination || scan->tablesample != NULL || scan->isShareScan ||
+        ((PartIterator*)input)->direction != ForwardScanDirection)
+        return NULL;
+
+    TargetEntry* entry = get_tle_by_resno(input->targetlist, cols[0]);
+    if (entry == NULL || !IsA(entry->expr, Var))
+        return NULL;
+
+    Var* key = (Var*)entry->expr;
+    if (key->varno != scan->scanrelid || key->varlevelsup != 0 || key->vartype != INT8OID ||
+        key->varattno <= 0 || tlist_member((Node*)entry->expr, output) == NULL)
+        return NULL;
+
+    if (contain_subplans((Node*)having) || contain_subplans((Node*)output) ||
+        contain_volatile_functions((Node*)having) || contain_volatile_functions((Node*)output))
+        return NULL;
+
+    RangeTblEntry* rte = planner_rt_fetch(scan->scanrelid, root);
+    if (rte->rtekind != RTE_RELATION)
+        return NULL;
+
+    Relation rel = heap_open(rte->relid, NoLock);
+    bool ownsGroup = false;
+    if (RelationIsPartitioned(rel) && !RelationIsSubPartitioned(rel) && rel->partMap != NULL &&
+        PartitionMapIsHash(rel->partMap)) {
+        int2vector* keys = PartitionMapGetPartKeyArray(rel->partMap);
+        ownsGroup = keys->dim1 == 1 && keys->values[0] == key->varattno;
+    }
+    heap_close(rel, NoLock);
+    return ownsGroup ? entry->expr : NULL;
+}
+#endif
+
 static Plan* generate_hashagg_plan(PlannerInfo* root, Plan* plan, List* final_list, AggClauseCosts* agg_costs,
     int numGroupCols, const double* numGroups, WindowLists* wflists, AttrNumber* groupColIdx, Oid* groupColOps,
     bool* needs_stream, Size hash_entry_size, AggOrientation agg_orientation, RelOptInfo* rel_info)
@@ -11993,6 +12364,23 @@ static Plan* generate_hashagg_plan(PlannerInfo* root, Plan* plan, List* final_li
             agg_orientation);
         return plan;
     }
+#ifdef ENABLE_HTAP
+    Expr* partitionKey = imcs_partition_agg_key(root, plan, final_list, qual, agg_costs, numGroupCols,
+        groupColIdx, groupColOps);
+    if (partitionKey != NULL) {
+        /* An Agg directly over the iterator consumes whole partitions. The
+         * CU range balancing path is limited to Scan and broadcast Join roots. */
+        long groups = (long)Min(clamp_row_est(final_groups), (double)LONG_MAX);
+        Agg* local = make_agg(root, final_list, qual, AGG_HASHED, agg_costs, numGroupCols,
+            local_groupColIdx, groupColOps, NULL, groups, plan, wflists, false, true, NIL,
+            hash_entry_size, true, agg_orientation);
+        if (local->is_sonichash) {
+            ((PartIterator*)plan)->wholePartitionPerWorker = true;
+            *needs_stream = false;
+            return make_redistribute_for_agg(root, &local->plan, list_make1(partitionKey), 1.0, NULL, true);
+        }
+    }
+#endif
 #endif
     /* Confirm whether the distributed_key has skew */
     if (SKEW_OPT_OFF != u_sess->opt_cxt.skew_strategy_opt)

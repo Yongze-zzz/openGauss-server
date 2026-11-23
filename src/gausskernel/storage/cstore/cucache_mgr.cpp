@@ -160,6 +160,18 @@ DataSlotTag DataCacheMgr::InitOBSSlotTag(uint32 hostNameHash, uint32 bucketNameH
  * @Return: slot id
  * @See also:
  */
+void DataCacheMgr::UnpinDataBlockForPlacement(CacheSlotId_t slotId)
+{
+    m_cache_mgr->UnpinCacheBlockForPlacement(slotId);
+}
+
+CacheSlotId_t DataCacheMgr::PinReadyDataBlockForPlacement(DataSlotTag* dataSlotTag)
+{
+    CacheTag tag = {0};
+    m_cache_mgr->InitCacheBlockTag(&tag, dataSlotTag->slotType, &dataSlotTag->slotTag, sizeof(DataSlotTagKey));
+    return m_cache_mgr->PinReadyCacheBlockForPlacement(&tag);
+}
+
 CacheSlotId_t DataCacheMgr::FindDataBlock(DataSlotTag* dataSlotTag, bool first_enter_block)
 {
     CacheSlotId_t slot = CACHE_BLOCK_INVALID_IDX;
@@ -527,7 +539,7 @@ CUUncompressedRetCode DataCacheMgr::StartUncompressCU(
     }
     /* Restore the same physical layout after eviction/reload, under the CU lock. */
    if (cuPtr->imcsDesc != NULL)
-       ImcsPartitionWisePlaceCU(cuPtr, cuPtr->imcsDesc->dataNumaNode);
+       ImcsPartitionWisePlaceCU(cuPtr, ImcsCurrentDataNode(cuPtr->imcsDesc));
 #else
     cuPtr->UnCompress(cuDescPtr->row_count, cuDescPtr->magic, align_size);
 #endif
@@ -787,6 +799,17 @@ void DataCacheMgr::SetOBSDataBlockValue(
  * @IN slotId: slot id
  * @See also:
  */
+bool DataCacheMgr::TryLockReadyDataBlock(CacheSlotId_t slotId)
+{
+    if (!m_cache_mgr->TryAcquireCompressLock(slotId))
+        return false;
+    if (m_cache_mgr->IsIOBusy(slotId) || GetCUBuf(slotId)->m_cache_compressed) {
+        m_cache_mgr->ReleaseCompressLock(slotId);
+        return false;
+    }
+    return true; // Caller owns the compress lock and must release it.
+}
+
 void DataCacheMgr::AcquireCompressLock(CacheSlotId_t slotId)
 {
     return m_cache_mgr->AcquireCompressLock(slotId);

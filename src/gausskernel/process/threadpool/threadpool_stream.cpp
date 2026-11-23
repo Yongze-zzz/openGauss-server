@@ -128,6 +128,8 @@ void ThreadPoolStream::InitStream()
     SetStreamWorkerInfo(m_producer);
 
     u_sess->proc_cxt.MyProcPort = (Port*)palloc0(sizeof(Port));
+    /* A pooled Stream session has no client socket. */
+    u_sess->proc_cxt.MyProcPort->sock = PGINVALID_SOCKET;
     SetStreamWorkerInfo(m_producer);
     ExtractProduerInfo();
 

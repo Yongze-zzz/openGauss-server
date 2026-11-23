@@ -16,6 +16,7 @@
 -- under the License.
 
 select/*+
+    set(enable_broadcast off)
     leading(((orders customer nation) lineitem))
     hashjoin(orders customer)
     hashjoin(orders customer nation)

@@ -20,6 +20,11 @@ objfiles.txt
 /mppdb_temp_install_gcc10_numa/
 /binarylibs/
 /results/
+/imcs_partition_results/20*/
+/imcs_partition_results/produce_figure/
+/reproduction/analysis/
+/reproduction/logs/
+__pycache__/
 /GNUmakefile
 /config.status
 /ereport.txt

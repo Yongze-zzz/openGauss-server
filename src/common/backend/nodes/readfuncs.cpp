@@ -801,6 +801,9 @@ static inline void CheckStrNotNull(const char *token, char *errMsg)
         READ_NODE_FIELD(origin_consumer_nodes);             \
         READ_BOOL_FIELD(is_recursive_local);                \
         READ_STREAM_ID();                                   \
+        IF_EXIST(chipletOwnerHandoff) {                     \
+            READ_BOOL_FIELD(chipletOwnerHandoff);           \
+        }                                                   \
                                                             \
         READ_DONE();                                        \
     } while (0)
@@ -4015,6 +4018,12 @@ static PartIterator* _readPartIterator(PartIterator* local_node)
     READ_INT_FIELD(itrs);
     READ_ENUM_FIELD(direction, ScanDirection);
     READ_NODE_FIELD(param);
+    IF_EXIST(wholePartitionPerWorker) {
+        READ_BOOL_FIELD(wholePartitionPerWorker);
+    }
+    IF_EXIST(chipletJoinOwner) {
+        READ_BOOL_FIELD(chipletJoinOwner);
+    }
 
     READ_DONE();
 }
@@ -5964,6 +5973,12 @@ static VecPartIterator* _readVecPartIterator(VecPartIterator* local_node)
     READ_INT_FIELD(itrs);
     READ_ENUM_FIELD(direction, ScanDirection);
     READ_NODE_FIELD(param);
+    IF_EXIST(wholePartitionPerWorker) {
+        READ_BOOL_FIELD(wholePartitionPerWorker);
+    }
+    IF_EXIST(chipletJoinOwner) {
+        READ_BOOL_FIELD(chipletJoinOwner);
+    }
 
     READ_DONE();
 }

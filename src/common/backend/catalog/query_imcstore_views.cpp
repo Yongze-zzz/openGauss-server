@@ -26,6 +26,7 @@
 #include "utils/hsearch.h"
 #ifdef ENABLE_HTAP
 #include "access/htap/imcs_hash_table.h"
+#include "access/htap/imcs_adaptive.h"
 #endif
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
@@ -158,3 +159,13 @@ Datum query_imcstore_views(PG_FUNCTION_ARGS)
 #endif
 }
 
+
+Datum imcs_adapt_status(PG_FUNCTION_ARGS)
+{
+#ifdef ENABLE_HTAP
+    PG_RETURN_TEXT_P(cstring_to_text(ImcsAdaptStatusJson(PG_GETARG_OID(0))));
+#else
+    ereport(ERROR, (errmsg("IMCS support is not enabled")));
+    PG_RETURN_NULL();
+#endif
+}

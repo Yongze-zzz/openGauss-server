@@ -35,6 +35,6 @@ endif
 
 override CPPFLAGS += -I${top_builddir}/contrib/ndpplugin
 
-OBJS = imcs_hash_table.o imcucache_mgr.o ss_imcucache_mgr.o imcstore_insert.o imcs_ctlg.o imcustorage.o imcstore_am.o imcstore_vacuum.o imcstore_delta.o borrow_mem_pool.o share_mem_pool.o imcs_partition_wise.o
+OBJS = imcs_hash_table.o imcucache_mgr.o ss_imcucache_mgr.o imcstore_insert.o imcs_ctlg.o imcustorage.o imcstore_am.o imcstore_vacuum.o imcstore_delta.o borrow_mem_pool.o share_mem_pool.o imcs_partition_wise.o imcs_numa_policy.o imcs_adaptive.o imcs_numa_cpu.o
 
 include $(top_srcdir)/src/gausskernel/common.mk

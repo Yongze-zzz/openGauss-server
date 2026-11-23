@@ -233,6 +233,7 @@ void IMCUDataCacheMgr::BaseCacheCU(CU* srcCU, CU* slotCU)
     slotCU->m_numericIntLike = srcCU->m_numericIntLike;
     slotCU->m_partitionWiseBuffer = srcCU->m_partitionWiseBuffer;
     slotCU->m_partitionWiseBufferSize = srcCU->m_partitionWiseBufferSize;
+    slotCU->m_partitionWiseAccounted = srcCU->m_partitionWiseAccounted;
 }
  
 void IMCUDataCacheMgr::CacheCU(CU* srcCU, CU* slotCU)
@@ -242,6 +243,19 @@ void IMCUDataCacheMgr::CacheCU(CU* srcCU, CU* slotCU)
     slotCU->m_srcData = srcCU->m_srcData;
     slotCU->m_offset = srcCU->m_offset;
     BaseCacheCU(srcCU, slotCU);
+    if (srcCU->m_partitionWiseBuffer != NULL) {
+        // Transfer mmap ownership; error cleanup of the source must not free
+        // memory that has already been published in a cache slot.
+        srcCU->m_partitionWiseBuffer = NULL;
+        srcCU->m_partitionWiseBufferSize = 0;
+        srcCU->m_partitionWiseAccounted = false;
+        srcCU->m_srcBuf = NULL;
+        srcCU->m_srcData = NULL;
+        srcCU->m_nulls = NULL;
+        srcCU->m_offset = NULL;
+        srcCU->m_srcBufSize = 0;
+        srcCU->m_offsetSize = 0;
+    }
 }
  
 bool IMCUDataCacheMgr::CacheBorrowMemCU(CU* srcCU, CU* slotCU, CUDesc* cuDescPtr)
@@ -281,7 +295,7 @@ void IMCUDataCacheMgr::SaveCU(IMCSDesc* imcsDesc, RelFileNodeOld* rnode, int col
     }
     DataSlotTag slotTag = InitCUSlotTag(rnode, colId, cuDescPtr->cu_id, cuDescPtr->cu_pointer);
     /* Bind before publishing a cache slot; native error cleanup still owns cuPtr. */
-    ImcsPartitionWisePlaceCU(cuPtr, imcsDesc->dataNumaNode);
+    ImcsPartitionWisePlaceCU(cuPtr, ImcsCurrentDataNode(imcsDesc));
 RETRY_RESERVE_DATABLOCK:
     bool hasFound = false;
     CacheSlotId_t slotId = ReserveDataBlock(&slotTag, cuDescPtr->cu_size, hasFound);
@@ -302,6 +316,10 @@ RETRY_RESERVE_DATABLOCK:
     }
 
     slotCU->imcsDesc = imcsDesc;
+    if (slotCU->m_partitionWiseBuffer != NULL && !slotCU->m_partitionWiseAccounted) {
+        pg_atomic_fetch_add_u64(&imcsDesc->numaMappedBytes, slotCU->m_partitionWiseBufferSize);
+        slotCU->m_partitionWiseAccounted = true;
+    }
     UnPinDataBlock(slotId);
     DataBlockCompleteIO(slotId);
     pg_atomic_add_fetch_u64(&imcsDesc->cuSizeInMem, (uint64)cuDescPtr->cu_size);

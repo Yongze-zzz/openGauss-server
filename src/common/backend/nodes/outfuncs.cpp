@@ -1261,6 +1261,8 @@ static void _outStream(StringInfo str, Stream* node)
         WRITE_INT_FIELD(streamID);
     }
 #endif
+    if (node->chipletOwnerHandoff)
+        WRITE_BOOL_FIELD(chipletOwnerHandoff);
 }
 
 /*
@@ -1634,6 +1636,10 @@ static void _outPartIterator(StringInfo str, PartIterator* node)
     WRITE_INT_FIELD(itrs);
     WRITE_ENUM_FIELD(direction, ScanDirection);
     WRITE_NODE_FIELD(param);
+    if (node->wholePartitionPerWorker)
+        WRITE_BOOL_FIELD(wholePartitionPerWorker);
+    if (node->chipletJoinOwner)
+        WRITE_BOOL_FIELD(chipletJoinOwner);
 }
 
 static void _outSubqueryScan(StringInfo str, SubqueryScan* node)
@@ -6328,6 +6334,10 @@ static void _outVecPartIterator(StringInfo str, VecPartIterator* node)
     WRITE_INT_FIELD(itrs);
     WRITE_ENUM_FIELD(direction, ScanDirection);
     WRITE_NODE_FIELD(param);
+    if (node->wholePartitionPerWorker)
+        WRITE_BOOL_FIELD(wholePartitionPerWorker);
+    if (node->chipletJoinOwner)
+        WRITE_BOOL_FIELD(chipletJoinOwner);
 }
 
 static void _outVecLimit(StringInfo str, VecLimit* node)
@@ -6424,6 +6434,8 @@ static void _outVecStream(StringInfo str, VecStream* node)
 #ifdef USE_SPQ
     WRITE_INT_FIELD(streamID);
 #endif
+    if (node->chipletOwnerHandoff)
+        WRITE_BOOL_FIELD(chipletOwnerHandoff);
 }
 
 #ifdef PGXC

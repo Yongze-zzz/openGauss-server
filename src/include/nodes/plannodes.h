@@ -1693,6 +1693,8 @@ typedef struct PartIterator {
     int itrs;               /* the number of the partitions */
     ScanDirection direction;
     PartIteratorParam* param;
+    bool wholePartitionPerWorker; /* Local final aggregation requires unsplit partitions. */
+    bool chipletJoinOwner;  /* Route matching hash buckets to the same stable lane. */
     /*
      * Below three variables are used to record starting partition id, ending partition id and number of
      * partitions.

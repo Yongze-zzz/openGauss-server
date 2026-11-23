@@ -136,8 +136,18 @@ extern int encrypte_main(int argc, char* const argv[]);
 /*
  * Any openGauss server process begins execution here.
  */
+#if defined(ENABLE_HTAP) && defined(__USE_NUMA)
+#include "access/htap/imcs_numa_cpu.h"
+#endif
+
 int main(int argc, char* argv[])
 {
+#if defined(ENABLE_HTAP) && defined(__USE_NUMA)
+    if (imcsnuma::CaptureLauncherMemoryPolicy() != 0) {
+        fprintf(stderr, "Cannot read launcher NUMA memory policy: %s\n", strerror(errno));
+        return 1;
+    }
+#endif
     InitProcessCommandFuncs();
     char* mmap_env = NULL;
 

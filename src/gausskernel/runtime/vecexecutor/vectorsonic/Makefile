@@ -29,7 +29,7 @@ ifneq "$(MAKECMDGOALS)" "clean"
     endif
   endif
 endif
-OBJS = vsonichash.o vsonichashjoin.o vsonichashagg.o vsonicpartition.o vsonicfilesource.o
+OBJS = vsonichash.o vsonichashjoin.o vsonicradixjoin.o vsonichashagg.o vsonicsharedagg.o vsonicpartition.o vsonicfilesource.o
 
 SUBDIRS     = sonicarray
 include $(top_srcdir)/src/gausskernel/common.mk

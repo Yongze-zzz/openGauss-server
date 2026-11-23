@@ -31,6 +31,9 @@
  * associated with the process.
  */
 #include "postgres.h"
+#if defined(ENABLE_HTAP) && defined(__USE_NUMA)
+#include "access/htap/imcs_numa_cpu.h"
+#endif
 #include "knl/knl_variable.h"
 
 #include <signal.h>
@@ -874,7 +877,13 @@ void InitProcess(void)
         if (!g_instance.numa_cxt.inheritThreadPool) {
             bind_thread_to_numa(t_thrd.proc->nodeno);
         }
-        numa_set_localalloc();
+#ifdef ENABLE_HTAP
+        if (imcsnuma::LauncherBindNodes()) {
+            if (imcsnuma::RestoreLauncherMemoryPolicy() != 0)
+                ereport(FATAL, (errmsg("Cannot preserve launcher NUMA memory binding: %m")));
+        } else
+#endif
+            numa_set_localalloc();
     }
 #endif
 

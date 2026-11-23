@@ -206,6 +206,15 @@ public:
 
     /* Get the serialize plan. */
     PlannedStmt* getPlan();
+    bool allowsImcsLocalTasks(bool requireUnsorted = false) const
+    {
+        // Explicit hashing/gather must remove any downstream SMP-lane
+        // distribution dependency before scan ownership is changed.
+        return m_streamNode != NULL && (!requireUnsorted || m_streamNode->sort == NULL) &&
+            (m_streamNode->type == STREAM_GATHER ||
+             (m_streamNode->type == STREAM_REDISTRIBUTE &&
+              m_parallel_desc.distriType == LOCAL_DISTRIBUTE));
+    }
 
     /* Get the snap shot data. */
     Snapshot getSnapShot();
@@ -508,6 +517,17 @@ private:
     int m_nth;
 
     bool m_sharedContextInit;
+    int* m_radixBroadcastChannels;
+    int m_radixBroadcastChannelCount;
+
+    /* The parent session captures this before a Stream worker restores GUCs.
+     * Delaying first-touch lets NPS distribute producer-owned local buffers. */
+    bool m_deferSharedContextInit;
+#ifdef ENABLE_HTAP
+    /* True only when the Stream key retains an exact NPS physical-partition
+     * lineage. A generic single-key hash is not sufficient for locality. */
+    bool m_imcsHotflowEligible;
+#endif
     int64 m_broadcastSize;
 
     void* m_skewState;

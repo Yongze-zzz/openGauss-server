@@ -56,6 +56,9 @@
 #include "utils/palloc.h"
 #include "utils/ps_status.h"
 #include "executor/executor.h"
+#if defined(ENABLE_HTAP) && defined(__USE_NUMA)
+#include "access/htap/imcs_numa_cpu.h"
+#endif
 
 #include "communication/commproxy_interface.h"
 #include "utils/mem_snapshot.h"
@@ -103,6 +106,13 @@ ThreadPoolControler::~ThreadPoolControler()
 
 void ThreadPoolControler::Init(bool enableNumaDistribute)
 {
+#if defined(ENABLE_HTAP) && defined(__USE_NUMA)
+    const bool preserveLauncherBind = imcsnuma::LauncherBindNodes() != 0;
+    if (imcsnuma::RestoreLauncherMemoryPolicy() != 0)
+        ereport(FATAL, (errmsg("Cannot restore launcher NUMA memory binding: %m")));
+#else
+    const bool preserveLauncherBind = false;
+#endif
     m_enableNumaDistribute = enableNumaDistribute;
 
     m_threadPoolContext = AllocSetContextCreate(g_instance.instance_context,
@@ -137,7 +147,7 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
              * more memory allocation local to worker thread.
              */
 #ifdef __USE_NUMA
-            if (enableNumaDistribute) {
+            if (enableNumaDistribute && !preserveLauncherBind) {
                 numa_set_preferred(numaId);
             }
 #endif
@@ -148,7 +158,7 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
             maxThreadNum = (int)round(
                 (double)m_maxPoolSize * ((double)m_cpuInfo.cpuArrSize[numaId] / (double)m_cpuInfo.activeCpuNum));
             maxStreamNum = (int)round(
-                (double)m_maxPoolSize * ((double)m_cpuInfo.cpuArrSize[numaId] / (double)m_cpuInfo.activeCpuNum));
+                (double)MAX_STREAM_POOL_SIZE * ((double)m_cpuInfo.cpuArrSize[numaId] / (double)m_cpuInfo.activeCpuNum));
             cpuNum = m_cpuInfo.cpuArrSize[numaId];
             cpuArr = m_cpuInfo.cpuArr[numaId];
 
@@ -157,7 +167,10 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
         } else {
             expectThreadNum = m_threadNum / m_groupNum;
             maxThreadNum = m_maxPoolSize / m_groupNum;
-            maxStreamNum = m_maxPoolSize / m_groupNum;
+            // Stream stages can have many more tasks than session workers.
+            // Keep originating-group ownership, but use the independent Stream
+            // capacity rather than shrinking the worker ceiling across groups.
+            maxStreamNum = MAX_STREAM_POOL_SIZE / m_groupNum;
             numaId = -1;
             tmpNumaId = numaId;
         }
@@ -172,7 +185,7 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
     }
 
 #ifdef __USE_NUMA
-    if (enableNumaDistribute) {
+    if (enableNumaDistribute && !preserveLauncherBind) {
         /*
          * Keep shared/global allocations distributed over the NUMA nodes that
          * actually participate in this instance.  Using numa_all_nodes_ptr
@@ -773,19 +786,9 @@ ThreadId ThreadPoolControler::GetStreamFromPool(StreamProducer* producer)
         return InvalidTid;
     }
 
-    /*
-     * In NUMA-distributed mode, place the same SMP lane of every operator in
-     * the same thread-pool group.  The round-robin mapping spreads a query's
-     * streams over all active NUMA groups and, when query DOP equals the
-     * active CPU count, naturally gives each group one lane per active CPU.
-     * This also prevents one session group from exhausting its per-group
-     * stream limit while the other groups remain idle.
-     */
-    if (m_enableNumaDistribute && m_groupNum > 1) {
-        uint32 groupId = producer->getKey().smpIdentifier % (uint32)m_groupNum;
-        targetGroup = m_groups[groupId];
-    }
-
+    /* Preserve the originating thread-pool group. IMCS NPS establishes its
+     * own execution affinity before ExecutorStart; do not route every Stream
+     * across NUMA groups implicitly, including queries with NPS disabled. */
     return targetGroup->GetStreamFromPool(producer);
 }
 

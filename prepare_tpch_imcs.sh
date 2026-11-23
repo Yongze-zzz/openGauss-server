@@ -9,7 +9,12 @@ dbgen_dir=${DBGEN_DIR:-${TPCH_ROOT:-/mnt/nvme1p1/yanyz/TPCH-openGauss-TestTools}
 data_dir=${DATA_DIR:-/home/yanyz/olap/tpch-data/sf${sf}}
 schema=${SCHEMA:-tpch_sf${sf//./_}_imcs_h${partitions}}
 workers=${POPULATE_WORKERS:-64}
+parallel_populate=${PARALLEL_POPULATE:-on}
+[[ $parallel_populate == on || $parallel_populate == off ]] || { echo 'PARALLEL_POPULATE must be on or off.' >&2; exit 2; }
 numa_map=${IMCS_PARTITION_NUMA_MAP:-}
+nps=${ENABLE_IMCS_NPS:-off}
+nps_groups=${IMCS_NPS_GROUPS:-}
+scan_cpus=${IMCS_PARTITION_SCAN_CPUS:-}
 tables=(region nation supplier customer part partsupp orders lineitem)
 sql=("${GSQL_BIN:-gsql}" -X -v ON_ERROR_STOP=1 -P pager=off
      -d "${DB_NAME:-tpch}" -p "${PORT:-${PGPORT:-19999}}")
@@ -97,15 +102,19 @@ populate() {
     {
         echo '\timing on'
         echo 'SET statement_timeout = 0;'
-        echo 'SET enable_parallel_populate = on;'
+        echo "SET enable_parallel_populate = $parallel_populate;"
         echo "SET imcs_parallel_populate_workers = $workers;"
-        if [[ -n $numa_map ]]; then
-            echo "SET imcs_partition_numa_map = :'numa_map';"
-        fi
+        # An empty map explicitly restores native placement, including when a
+        # role/database default or PGOPTIONS supplied a nonempty mapping.
+        echo "SET imcs_partition_numa_map = :'numa_map';"
+        echo "SET enable_imcs_nps = :'nps';"
+        echo "SET imcs_nps_groups = :'nps_groups';"
+        echo "SET imcs_partition_scan_cpus = :'scan_cpus';"
         for table in "${tables[@]}"; do
             echo "ALTER TABLE :\"schema\".$table IMCSTORED;"
         done
-    } | "${sql[@]}" -v "schema=$schema" -v "numa_map=$numa_map"
+    } | "${sql[@]}" -v "schema=$schema" -v "numa_map=$numa_map" \
+        -v "nps=$nps" -v "nps_groups=$nps_groups" -v "scan_cpus=$scan_cpus"
     status
 }
 

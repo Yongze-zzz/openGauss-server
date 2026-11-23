@@ -22,7 +22,9 @@
  * -------------------------------------------------------------------------
  */
 #include <time.h>
+#include <sched.h>
 #include "postgres.h"
+#include "vectorsonic/vsonicsharedagg.h"
 #include "knl/knl_variable.h"
 
 #ifdef PGXC
@@ -70,12 +72,17 @@
 #include "optimizer/nodegroups.h"
 #include "optimizer/dataskew.h"
 #include "instruments/instr_unique_sql.h"
+#ifdef ENABLE_HTAP
+#include "access/htap/imcs_partition_wise.h"
+#include "utils/selfuncs.h"
+#include "vecexecutor/vec_cache_coord.h"
+#endif
 
 static TupleTableSlot* ExecStream(PlanState* state);
 static void CheckStreamMatchInfo(
     StreamFlowCheckInfo checkInfo, int plan_node_id, List* consumerExecNode, int consumerDop, bool isLocalStream);
-static void InitStream(StreamFlowCtl* ctl, StreamTransType type);
-static void InitStreamFlow(StreamFlowCtl* ctl);
+static void InitStream(StreamFlowCtl* ctl, StreamTransType type, Plan* parent);
+static void InitStreamFlow(StreamFlowCtl* ctl, Plan* parent = NULL);
 
 #define NODENAMELEN 64
 
@@ -371,7 +378,103 @@ static StreamObj* FindStreamObjBySmpId(List* streamList, uint32 smpIdentifier)
     return obj;
 }
 
-static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedStmt* pstmt)
+#ifdef ENABLE_HTAP
+static bool StreamProfileNodeMatches(const char* variable, int nodeId)
+{
+    const char* value = gs_getenv_r(variable);
+    if (value == NULL)
+        return false;
+    char* end = NULL;
+    long requested = strtol(value, &end, 10);
+    return end != value && *end == '\0' && requested > 0 && requested == nodeId;
+}
+
+static StreamAggCacheRange* BuildAggCacheRanges(int workers, int* workerLlc)
+{
+    if (workers <= 1 || workers > CPU_SETSIZE)
+        return NULL;
+    int cpus[CPU_SETSIZE];
+    ImcsPartitionWiseGetWorkerCpus(workers, cpus);
+    StreamAggCacheRange* ranges = (StreamAggCacheRange*)palloc0(CPU_SETSIZE * sizeof(*ranges));
+    int ordinal = 0;
+    for (int worker = 0; worker < workers; ++worker) {
+        int domain = RhjLlcDomain(cpus[worker]);
+        if (domain < 0 || domain >= CPU_SETSIZE) {
+            pfree(ranges);
+            return NULL;
+        }
+        if (workerLlc != NULL)
+            workerLlc[worker] = domain;
+        StreamAggCacheRange& range = ranges[domain];
+        if (range.count == 0) {
+            range.first = worker;
+            range.ordinal = ordinal++;
+        } else if (range.first + range.count != worker) {
+            pfree(ranges);
+            return NULL;
+        }
+        ++range.count;
+    }
+    return ranges;
+}
+
+static void PreselectRadixBroadcastReceivers(StreamSharedContext* context, Stream* stream, Plan* parent)
+{
+    Plan* plan = &stream->scan.plan;
+    int consumers = stream->smpDesc.consumerDop;
+    if (!u_sess->attr.attr_sql.radix_shared_preselect_builders || parent == NULL || !IsA(parent, VecHashJoin) ||
+        parent->righttree != plan || parent->dop != consumers || consumers > CPU_SETSIZE ||
+        parent->ispwj || parent->allParam != NULL || plan->allParam != NULL ||
+        parent->recursive_union_plan_nodeid > 0 || plan->recursive_union_plan_nodeid > 0 ||
+        stream->is_recursive_local || stream->is_dummy || IsThreadProcessStreamRecursive() ||
+        u_sess->attr.attr_sql.enable_imcs_stream_consumer_placement)
+        return;
+    VecHashJoin* join = (VecHashJoin*)parent;
+    if (!join->isSonicHash || join->join.jointype != JOIN_INNER || join->rebuildHashTable ||
+        join->hashclauses == NIL || PLAN_LOCAL_ROWS(plan) / SET_DOP(plan->dop) < 4 * BatchMaxSize)
+        return;
+    ListCell* cell = NULL;
+    foreach (cell, join->hashclauses) {
+        Node* clause = (Node*)lfirst(cell);
+        if (!IsA(clause, OpExpr))
+            return;
+        ListCell* arg = NULL;
+        foreach (arg, ((OpExpr*)clause)->args) {
+            if (!IsA(lfirst(arg), Var))
+                return;
+        }
+    }
+
+    int workerCpus[CPU_SETSIZE];
+    int receivers[CPU_SETSIZE];
+    bool selected[CPU_SETSIZE] = {};
+    ImcsPartitionWiseGetWorkerCpus(consumers, workerCpus);
+    int leaders = 0;
+    for (int worker = 0; worker < consumers; ++worker) {
+        int domain = RhjLlcDomain(workerCpus[worker]);
+        if (domain < 0 || domain >= CPU_SETSIZE)
+            return;
+        /* Positive values identify the elected receiver, negative its followers. */
+        receivers[worker] = selected[domain] ? -(domain + 1) : domain + 1;
+        if (!selected[domain]) {
+            selected[domain] = true;
+            ++leaders;
+        }
+    }
+    context->radixBroadcastReceiverDomains = (int*)palloc((Size)consumers * sizeof(int));
+    for (int worker = 0; worker < consumers; ++worker) {
+        context->radixBroadcastReceiverDomains[worker] = receivers[worker];
+        if (receivers[worker] < 0) {
+            for (int producer = 0; producer < stream->smpDesc.producerDop; ++producer)
+                context->is_connect_end[worker][producer] = true;
+        }
+    }
+    ereport(LOG, (errmsg("RHJ preselected broadcast stream=%d join=%d builders=%d receivers=%d",
+        plan->plan_node_id, parent->plan_node_id, leaders, consumers), errhidestmt(true), ErrOutToClient(false)));
+}
+#endif
+
+static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedStmt* pstmt, Plan* parent)
 {
     if (!STREAM_IS_LOCAL_NODE(streamNode->smpDesc.distriType))
         return NULL;
@@ -384,10 +487,25 @@ static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedS
     bool** is_connect_end = NULL;
     StringInfo** messages = NULL;
     int* scanLoc = NULL;
+    int* scanStride = NULL;
     char context_name[NODENAMELEN];
     int rc = 0;
     int consumerNum = streamNode->smpDesc.consumerDop;
     int producerNum = streamNode->smpDesc.producerDop;
+    bool consumerPlacement = false;
+#ifdef ENABLE_HTAP
+    if (streamNode->chipletOwnerHandoff && (!IsA((Plan*)streamNode, VecStream) || consumerNum != producerNum ||
+        streamNode->type != STREAM_REDISTRIBUTE || streamNode->smpDesc.distriType != LOCAL_DISTRIBUTE))
+        ereport(ERROR, (errmsg("Chiplet owner handoff requires matching local vector Stream lanes")));
+    consumerPlacement = IsA((Plan*)streamNode, VecStream) &&
+        streamNode->type == STREAM_REDISTRIBUTE &&
+        streamNode->smpDesc.distriType == LOCAL_DISTRIBUTE &&
+        consumerNum == producerNum &&
+        u_sess->attr.attr_sql.enable_imcs_nps &&
+        u_sess->attr.attr_sql.enable_imcs_stream_hotspot_split &&
+        u_sess->attr.attr_sql.enable_imcs_stream_consumer_placement &&
+        !u_sess->attr.attr_sql.enable_imcs_adapt;
+#endif
 
     Assert(streamNode->scan.plan.plan_node_id != 0);
     /* Set memory context name. */
@@ -411,6 +529,12 @@ static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedS
     MemoryContext oldCxt = MemoryContextSwitchTo(localStreamMemoryCtx);
 
     scanLoc = (int*)palloc0(sizeof(int) * consumerNum);
+    scanStride = (int*)palloc0(sizeof(int) * consumerNum);
+    if (u_sess->attr.attr_sql.enable_imcs_nps &&
+        (u_sess->attr.attr_sql.enable_imcs_stream_path_rebalance || consumerPlacement)) {
+        for (int i = 0; i < consumerNum; ++i)
+            scanLoc[i] = -1; /* Lazily initialize after the consumer enters its NPS lane. */
+    }
 
     /* Init data status. */
     dataStatus = (DataStatus**)palloc(sizeof(DataStatus*) * consumerNum);
@@ -422,7 +546,7 @@ static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedS
         messages[i] = (StringInfo*)palloc(sizeof(StringInfo) * producerNum);
         for (int j = 0; j < producerNum; j++) {
             dataStatus[i][j] = DATA_EMPTY;
-            is_connect_end[i][j] = false;
+            is_connect_end[i][j] = streamNode->chipletOwnerHandoff && i != j;
             messages[i][j] = (StringInfoData*)palloc0(sizeof(StringInfoData));
             initStringInfo(messages[i][j]);
         }
@@ -443,12 +567,157 @@ static StreamSharedContext* buildLocalStreamContext(Stream* streamNode, PlannedS
 
     sharedContext->vectorized = IsA(&(streamNode->scan.plan), VecStream);
     sharedContext->localStreamMemoryCtx = localStreamMemoryCtx;
+    sharedContext->is_connect_end = is_connect_end;
+#ifdef ENABLE_HTAP
+    bool eligibleRedistribution = sharedContext->vectorized && streamNode->type == STREAM_REDISTRIBUTE &&
+        streamNode->smpDesc.distriType == LOCAL_DISTRIBUTE &&
+        !streamNode->is_recursive_local && streamNode->scan.plan.recursive_union_plan_nodeid <= 0;
+    if (eligibleRedistribution && u_sess->attr.attr_sql.enable_imcs_stream_batch_ring) {
+        sharedContext->batchRings = (StreamBatchRing*)palloc0(
+            (Size)consumerNum * producerNum * sizeof(StreamBatchRing));
+        sharedContext->batchRingProducers = (StreamBatchRingProducer*)palloc0(
+            (Size)producerNum * sizeof(StreamBatchRingProducer));
+        sharedContext->batchRingProducerCount = producerNum;
+        sharedContext->batchRingSpareLimit =
+            Min(consumerNum, u_sess->attr.attr_sql.imcs_stream_batch_ring_extra_slots);
+    }
+    int nodeId = streamNode->scan.plan.plan_node_id;
+    if (streamNode->chipletOwnerHandoff) {
+        ereport(LOG, (errmsg("chiplet_owner_handoff node=%d lanes=%d channels=%d",
+            nodeId, producerNum, producerNum), errhidestmt(true), ErrOutToClient(false)));
+    }
+    if (u_sess->attr.attr_sql.enable_imcs_shared_sonic_agg)
+        InitSonicAggExchange(sharedContext, streamNode);
+    const auto* timeline = eligibleRedistribution ? RhjStreamTimeline() : NULL;
+    if (timeline != NULL) {
+        if (nodeId == u_sess->attr.attr_sql.imcs_rhj_overlap_peer_node) {
+            sharedContext->rhjCopyTimeline = (StreamRhjCopyTimeline*)palloc0(sizeof(StreamRhjCopyTimeline) * consumerNum);
+        }
+        if (nodeId == timeline->outputStream) {
+            sharedContext->rhjSendTimeline = (StreamRhjSendTimeline*)palloc0(sizeof(StreamRhjSendTimeline) * producerNum);
+        }
+    }
+    bool limitCopies = u_sess->attr.attr_sql.imcs_rhj_stream_copy_slots > 0 &&
+        u_sess->attr.attr_sql.radix_shared_build && u_sess->attr.attr_sql.imcs_rhj_stream_schedule_llc != -1;
+    if (eligibleRedistribution && streamNode->sort == NULL && !consumerPlacement &&
+        u_sess->attr.attr_sql.imcs_rhj_overlap_peer_kind == 2 &&
+        u_sess->attr.attr_sql.imcs_rhj_overlap_peer_node == nodeId &&
+        (limitCopies || u_sess->attr.attr_sql.imcs_rhj_stream_schedule_llc >= 0) &&
+        u_sess->attr.attr_sql.enable_imcs_nps && !u_sess->attr.attr_sql.enable_imcs_adapt &&
+        !u_sess->attr.attr_sql.enable_imcs_cache_coord && !u_sess->attr.attr_sql.enable_imcs_stream_path_rebalance &&
+        sharedContext->batchRings == NULL) {
+        if (limitCopies) {
+            sharedContext->rhjCopyStats = (StreamRhjCopyStats*)palloc0(sizeof(StreamRhjCopyStats) * consumerNum);
+        } else {
+            sharedContext->rhjDeferredProducer = (int*)palloc(sizeof(int) * consumerNum);
+            sharedContext->rhjCopyChecks = (uint64*)palloc0(sizeof(uint64) * consumerNum);
+            sharedContext->rhjSmallCopies = (uint64*)palloc0(sizeof(uint64) * consumerNum);
+            for (int i = 0; i < consumerNum; ++i)
+                sharedContext->rhjDeferredProducer[i] = -1;
+        }
+    }
+    const char* observe = u_sess->attr.attr_sql.enable_cache_trace ?
+        gs_getenv_r("OG_IMCS_AGG_CACHE_OBSERVE") : NULL;
+    bool profileAggStream = observe != NULL && strcmp(observe, "on") == 0;
+    bool coordinateAgg = u_sess->attr.attr_sql.imcs_agg_cache_slots > 0 &&
+        u_sess->attr.attr_sql.enable_imcs_agg_cache_window;
+    if (eligibleRedistribution && (coordinateAgg || profileAggStream)) {
+        const char* streams = gs_getenv_r("OG_IMCS_AGG_CACHE_STREAMS");
+        int first = 0;
+        int second = 0;
+        if (streams != NULL && sscanf(streams, "%d,%d", &first, &second) == 2 &&
+            first > 0 && second > 0 && first != second && (nodeId == first || nodeId == second)) {
+            StreamAggCacheDemand* demand = (StreamAggCacheDemand*)palloc0(sizeof(StreamAggCacheDemand));
+            demand->receivers = consumerNum;
+            demand->producers = producerNum;
+            demand->receiverWaiting = (uint8*)palloc0(consumerNum);
+            demand->producerWaiting = (uint8*)palloc0(producerNum);
+            bool stablePlacement = u_sess->attr.attr_sql.enable_imcs_nps &&
+                !u_sess->attr.attr_sql.enable_imcs_adapt && !consumerPlacement &&
+                producerNum == consumerNum && producerNum <= CPU_SETSIZE;
+            if (stablePlacement && (u_sess->attr.attr_sql.enable_imcs_agg_cache_chiplet || profileAggStream)) {
+                int* workerLlc = profileAggStream ? (int*)palloc(sizeof(int) * producerNum) : NULL;
+                StreamAggCacheRange* ranges = BuildAggCacheRanges(producerNum, workerLlc);
+                if (u_sess->attr.attr_sql.enable_imcs_agg_cache_chiplet)
+                    demand->localRanges = ranges;
+                if (ranges != NULL && profileAggStream) {
+                    demand->workerLlc = workerLlc;
+                    demand->receiveObservation = (StreamAggObservation*)palloc0(sizeof(StreamAggObservation) * consumerNum);
+                    demand->sendObservation = (StreamAggObservation*)palloc0(sizeof(StreamAggObservation) * producerNum);
+                }
+            }
+            sharedContext->aggCacheDemand = demand;
+        }
+    }
+    bool profileRedistribution = eligibleRedistribution && u_sess->attr.attr_sql.enable_cache_trace &&
+        StreamProfileNodeMatches("OG_STREAM_CACHE_PROFILE_NODE", nodeId);
+    bool profileBroadcast = sharedContext->vectorized && streamNode->type == STREAM_BROADCAST &&
+        streamNode->smpDesc.distriType == LOCAL_BROADCAST && !streamNode->is_recursive_local &&
+        streamNode->scan.plan.recursive_union_plan_nodeid <= 0 &&
+        StreamProfileNodeMatches("OG_STREAM_QUOTA_PROFILE_NODE", nodeId);
+    if (profileRedistribution || profileBroadcast) {
+        sharedContext->cacheProfileChannels = (StreamCacheChannelProfile*)palloc0(
+            (Size)consumerNum * producerNum * sizeof(StreamCacheChannelProfile));
+        sharedContext->cacheProfileProducerCount = producerNum;
+    }
+    if (sharedContext->vectorized && streamNode->type == STREAM_BROADCAST &&
+        streamNode->smpDesc.distriType == LOCAL_BROADCAST && consumerNum > 1 &&
+        u_sess->attr.attr_sql.enable_radix_hashjoin && u_sess->attr.attr_sql.radix_shared_build &&
+        u_sess->attr.attr_sql.enable_imcs_nps && !u_sess->attr.attr_sql.enable_imcs_adapt) {
+        sharedContext->radixBuildSlots = (StreamRadixBuildSlot*)palloc0(
+            sizeof(StreamRadixBuildSlot) * CPU_SETSIZE);
+        PreselectRadixBroadcastReceivers(sharedContext, streamNode, parent);
+    }
+#endif
     sharedContext->sharedBatches = sharedBatches;
     sharedContext->sharedTuples = sharedTuples;
     sharedContext->dataStatus = dataStatus;
-    sharedContext->is_connect_end = is_connect_end;
     sharedContext->messages = messages;
     sharedContext->scanLoc = scanLoc;
+    sharedContext->scanStride = scanStride;
+#ifdef ENABLE_HTAP
+    if (u_sess->attr.attr_sql.enable_imcs_cache_coord && u_sess->attr.attr_sql.enable_imcs_nps &&
+        !u_sess->attr.attr_sql.enable_imcs_adapt && streamNode->sort == NULL &&
+        !u_sess->attr.attr_sql.enable_imcs_stream_path_rebalance && !consumerPlacement &&
+        IsA((Plan*)streamNode, VecStream) && streamNode->type == STREAM_REDISTRIBUTE &&
+        streamNode->smpDesc.distriType == LOCAL_DISTRIBUTE && consumerNum == producerNum && producerNum > 1) {
+        int* groupNodes = (int*)palloc(sizeof(int) * producerNum);
+        sharedContext->cacheProducerGroup = (int*)palloc(sizeof(int) * producerNum);
+        sharedContext->cacheGroupStart = (int*)palloc(sizeof(int) * producerNum);
+        sharedContext->cacheLocalBurst = (uint8*)palloc0(sizeof(uint8) * consumerNum);
+        sharedContext->cacheGroupCount = ImcsPartitionWiseStreamGroups(producerNum,
+            sharedContext->cacheProducerGroup, sharedContext->cacheGroupStart, groupNodes);
+        if (sharedContext->cacheGroupCount < 2)
+            sharedContext->cacheGroupCount = 0;
+        pfree(groupNodes);
+        /* A group must occupy one contiguous range for the local-first scan. */
+        for (int i = 1; i < producerNum; ++i) {
+            if (sharedContext->cacheProducerGroup[i] < sharedContext->cacheProducerGroup[i - 1]) {
+                sharedContext->cacheGroupCount = 0;
+                break;
+            }
+        }
+    }
+#endif
+    sharedContext->consumerPlacement = consumerPlacement;
+#ifdef ENABLE_HTAP
+    if (consumerPlacement) {
+        sharedContext->placementProducerGroup = (int*)palloc(sizeof(int) * producerNum);
+        int* representatives = (int*)palloc(sizeof(int) * consumerNum);
+        sharedContext->placementGroupNodes = (int*)palloc(sizeof(int) * consumerNum);
+        sharedContext->placementGroupCount = ImcsPartitionWiseStreamGroups(producerNum,
+            sharedContext->placementProducerGroup, representatives, sharedContext->placementGroupNodes);
+        int groups = sharedContext->placementGroupCount;
+        sharedContext->placementGroupCapacity = (int*)palloc0(sizeof(int) * groups);
+        sharedContext->placementGroupClaims = (volatile int*)palloc0(sizeof(int) * groups);
+        for (int producer = 0; producer < producerNum; ++producer)
+            ++sharedContext->placementGroupCapacity[sharedContext->placementProducerGroup[producer]];
+        sharedContext->placementBytes = (uint64*)palloc0(sizeof(uint64) * consumerNum * groups);
+        sharedContext->placementSamples = (uint32*)palloc0(sizeof(uint32) * consumerNum);
+        sharedContext->placementSeenGroups = (uint64*)palloc0(sizeof(uint64) * consumerNum);
+        sharedContext->placementDone = (bool*)palloc0(sizeof(bool) * consumerNum);
+    }
+#endif
 
     /* Set stream key. */
     sharedContext->key_s.queryId = pstmt->queryId;
@@ -474,6 +743,7 @@ static void resetLocalStreamContext(StreamSharedContext* context)
         return;
 
     context->scanLoc[0] = 0;
+    context->scanStride[0] = 0;
     context->dataStatus[0][0] = DATA_EMPTY;
     context->is_connect_end[0][0] = false;
     resetStringInfo(context->messages[0][0]);
@@ -601,7 +871,7 @@ static void CheckStreamMatchInfo(
  * @param[IN] transType:  TCP or SCTP
  * @return: void
  */
-static void InitStream(StreamFlowCtl* ctl, StreamTransType transType)
+static void InitStream(StreamFlowCtl* ctl, StreamTransType transType, Plan* parent)
 {
     int i = 0;
     StreamKey key;
@@ -629,7 +899,7 @@ static void InitStream(StreamFlowCtl* ctl, StreamTransType transType)
 #endif
 
     StreamSharedContext* sharedContext = NULL;
-    sharedContext = buildLocalStreamContext(streamNode, pstmt);
+    sharedContext = buildLocalStreamContext(streamNode, pstmt, parent);
 
     key.queryId = pstmt->queryId;
     key.planNodeId = plan->plan_node_id;
@@ -872,7 +1142,7 @@ static void InitStream(StreamFlowCtl* ctl, StreamTransType transType)
  * @param[IN] ctl:  controller used to init stream
  * @return: void
  */
-static void InitStreamFlow(StreamFlowCtl* ctl)
+static void InitStreamFlow(StreamFlowCtl* ctl, Plan* parent)
 {
     if (ctl->plan) {
         Plan* oldPlan = ctl->plan;
@@ -962,7 +1232,7 @@ static void InitStreamFlow(StreamFlowCtl* ctl)
             } break;
             case T_Stream:
             case T_VecStream: {
-                InitStream(ctl, STREAM_COMM);
+                InitStream(ctl, STREAM_COMM, parent);
 
                 /* Create stream controller for current stream node */
                 if (NeedSetupSyncUpController(oldPlan)) {
@@ -1005,7 +1275,7 @@ static void InitStreamFlow(StreamFlowCtl* ctl)
                 if (oldPlan->righttree) {
                     ctl->plan = oldPlan->righttree;
                     ctl->checkInfo = oldCheckInfo;
-                    InitStreamFlow(ctl);
+                    InitStreamFlow(ctl, oldPlan);
                 }
 
                 break;

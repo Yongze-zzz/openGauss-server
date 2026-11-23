@@ -65,6 +65,7 @@
 struct StreamState;
 class StreamObj;
 class StreamNodeGroup;
+struct ChipletCacheActivity;
 struct SyncController;
 
 typedef bool (*scanStreamFun)(StreamState* node);
@@ -157,14 +158,131 @@ typedef struct TupleVector {
     int tupleCount;
 } TupleVector;
 
+enum StreamRadixBuildState { RADIX_BUILD_UNCLAIMED, RADIX_BUILD_RUNNING, RADIX_BUILD_FAILED };
+
+struct StreamRadixBuildSlot {
+    uint32 state;
+    void* table;
+};
+
+struct StreamCacheChannelProfile {
+    uint64 readyNs[2];
+    uint64 quotaWaitNs;
+    uint32 quotaWaits;
+    int producerNuma[2];
+};
+
+struct StreamBatchRing {
+    VectorBatch* spare;
+    uint32 written;
+    uint32 read;
+    uint32 spareParity;
+    bool partial;
+};
+
+struct StreamBatchRingProducer {
+    MemoryContext batchContext;
+    int spareCount;
+};
+
+struct StreamAggCacheRange {
+    int first;
+    int count;
+    int ordinal;
+};
+
+/* Profiling-only counters, owned by a single Stream endpoint. */
+const uint64 STREAM_AGG_OBSERVATION_NS = 200000000;
+
+struct StreamAggObservation {
+    uint64 windowStart;
+    uint64 waitNs;
+    uint64 rows[2];
+    uint64 copyNs[2];
+};
+
+struct StreamAggCacheDemand {
+    uint8* receiverWaiting;
+    uint8* producerWaiting;
+    int receivers;
+    int producers;
+    StreamAggCacheRange* localRanges;
+    int* workerLlc;
+    StreamAggObservation* receiveObservation;
+    StreamAggObservation* sendObservation;
+};
+
+struct StreamRhjCopyStats {
+    uint64 copies;
+    uint64 waits;
+    uint64 admitted;
+    uint64 expired;
+    uint64 waitNs;
+    uint32 peak;
+    int llc;
+};
+
+struct SonicAggExchange;
+
+struct StreamRhjCopyInterval {
+    uint64 startNs;
+    uint64 endNs;
+    int rows;
+};
+
+struct StreamRhjCopyTimeline {
+    StreamRhjCopyInterval* records;
+    uint32 size;
+    uint32 dropped;
+    int llc;
+    bool initialized;
+};
+
+struct StreamRhjSendTimeline {
+    uint64 lastRowNs;
+    uint64 lastPublishNs;
+    uint64 rows;
+};
+
 typedef struct StreamSharedContext {
     MemoryContext localStreamMemoryCtx; /**/
+    SonicAggExchange* sonicAggExchange;
+    StreamRadixBuildSlot* radixBuildSlots;
+    int* radixBroadcastReceiverDomains;
+    StreamCacheChannelProfile* cacheProfileChannels;
+    int cacheProfileProducerCount;
+    StreamBatchRing* batchRings;
+    StreamBatchRingProducer* batchRingProducers;
+    StreamAggCacheDemand* aggCacheDemand;
+    int batchRingProducerCount;
+    int batchRingSpareLimit;
     VectorBatch*** sharedBatches;
     TupleVector*** sharedTuples;
     StringInfo** messages;
     DataStatus** dataStatus;
     bool** is_connect_end;
     int* scanLoc;
+    int* scanStride;
+    int* cacheProducerGroup;
+    int* cacheGroupStart;
+    uint8* cacheLocalBurst;
+    int* rhjDeferredProducer;
+    uint64* rhjCopyChecks;
+    uint64* rhjSmallCopies;
+    StreamRhjCopyStats* rhjCopyStats;
+    StreamRhjCopyTimeline* rhjCopyTimeline;
+    StreamRhjSendTimeline* rhjSendTimeline;
+    int cacheGroupCount;
+    bool consumerPlacement;
+    int placementGroupCount;
+    int* placementProducerGroup;
+    int* placementGroupNodes;
+    int* placementGroupCapacity;
+    volatile int* placementGroupClaims;
+    uint64* placementBytes;
+    uint32* placementSamples;
+    uint64* placementSeenGroups;
+    bool* placementDone;
     TcpStreamKey key_s;
     bool vectorized;
     struct hash_entry** poll_entrys;
@@ -295,8 +413,25 @@ public:
 };
 
 /* Stream node group is book keeper for stream object. */
+class ImcsLocalTaskQueues;
+#ifdef ENABLE_HTAP
+struct RhjProbeOverlapDomain {
+    uint64 lookup;
+    uint64 match;
+    uint64 heterogeneous;
+    uint64 lastMatchYield;
+};
+#endif
+
 class StreamNodeGroup : public BaseObject {
 public:
+    ImcsLocalTaskQueues* m_imcsLocalTasks;
+#ifdef ENABLE_HTAP
+    RhjProbeOverlapDomain* m_rhjProbeOverlap = NULL;
+    uint32* m_rhjStreamCopies = NULL;
+    SonicAggExchange* m_sonicAggExchanges = NULL;
+    ChipletCacheActivity* m_chipletCacheActivity = NULL;
+#endif
     StreamNodeGroup();
 
     ~StreamNodeGroup();

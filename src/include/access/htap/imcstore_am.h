@@ -74,6 +74,11 @@ public:
 
     /* Set CU range for scan in redistribute. */
     void SetScanRange() override;
+    void SetPartitionCuRange(uint32 first, uint32 limit)
+    {
+        m_partitionFirstCu = first;
+        m_partitionCuLimit = limit;
+    }
 
     void FillPerRowGroupDelta(_in_ IMCStoreScanState* state, _in_ uint32 cuid, _out_ VectorBatch* vecBatchOut);
     bool InsertDeltaRowToBatch(_in_ IMCStoreScanState* state, ItemPointerData item, _out_ VectorBatch* vecBatchOut);
@@ -82,6 +87,8 @@ public:
 
     void GetCUDeleteMaskIfNeedForSSStandby(_in_ uint32 cuid);
     void GetCUDeleteMaskFromRemote(_in_ uint32 cuid, _in_ Snapshot snapShot);
+
+    IMCSDesc* GetImcsDesc() const { return m_imcstoreDesc; }
 
 private:
     IMCUStorage** m_imcuStorage;
@@ -94,6 +101,8 @@ private:
     uint64 m_deltaScanCurr;
     List* m_currentRowGroups;
     bool m_isShareScan = false;
+    uint32 m_partitionFirstCu = 0;
+    uint32 m_partitionCuLimit = 0;
 };
 
 typedef struct PinnedRowGroup : public BaseObject {

@@ -44,7 +44,7 @@
 --     value desc;
 
 select /*+
-    leading(((n s) ps))
+    leading((ps (n s)))
     hashjoin(n s)
     hashjoin(n s ps)
     no nestloop(n s)
@@ -70,7 +70,7 @@ group by
 having
     sum(ps.ps_supplycost * ps.ps_availqty) > (
         select /*+
-            leading(((n2 s2) ps2))
+            leading((ps2 (n2 s2)))
             hashjoin(n2 s2)
             hashjoin(n2 s2 ps2)
             no nestloop(n2 s2)

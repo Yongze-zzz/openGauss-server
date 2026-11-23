@@ -39,6 +39,7 @@ enum OperatorDataAccessOperation {
 enum OperatorDataAccessObject { DA_INPUT, DA_STATE, DA_BATCH, DA_SHARED_BUFFER,
     DA_CU_VALUES, DA_CU_NULLS, DA_CU_OFFSETS };
 enum OperatorDataAccessKind { DA_READ, DA_WRITE, DA_DELIVERED };
+enum OperatorDataAccessNode { DA_NODE_NOT_OBSERVED = -2, DA_NODE_UNKNOWN = -1 };
 
 struct OperatorDataAccessKey {
     int plan, peerPlan, stream, sourceWorker, targetWorker;
@@ -90,7 +91,7 @@ class OperatorDataAccessScope {
 public:
     OperatorDataAccessScope(PlanState* node, OperatorDataAccessOperation operation, uint64 rows,
         int peerPlan = 0, int stream = 0, int sourceWorker = -1, int targetWorker = -1,
-        int executionNode = -2);
+        int executionNode = DA_NODE_NOT_OBSERVED);
     ~OperatorDataAccessScope();
     bool Enabled() const { return m_stats != NULL; }
     void Observe(const void* address, Size bytes, OperatorDataAccessObject object, OperatorDataAccessKind access);

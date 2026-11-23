@@ -35,8 +35,10 @@
 #include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
 #include "vecexecutor/vecexecutor.h"
+#include "access/htap/imcs_adaptive.h"
 #ifdef ENABLE_HTAP
 #include "vecexecutor/operator_data_access.h"
+#include "access/htap/imcstore_am.h"
 #endif
 #include "vecexecutor/vectorbatch.h"
 #include "vecexecutor/vecnodes.h"
@@ -147,7 +149,7 @@ static bool NeedStub(const Plan* node)
     );
 }
 #endif   /* ENABLE_MULTIPLE_NODES */
-static VectorBatch* VectorEngineRun(PlanState* node)
+static VectorBatch* VectorEngineRun(PlanState* node, volatile ImcsAdaptSample* adaptSample = NULL)
 {
     VectorBatch* result = NULL;
     MemoryContext old_context = NULL;
@@ -171,6 +173,7 @@ static VectorBatch* VectorEngineRun(PlanState* node)
     Assert(node->vectorized);
 
     // Track this node from executor setup through instrumentation teardown.
+    RhjTrackEnter(node);
     VecCacheTraceEnter(node);
 
     if (node->nodeContext) {
@@ -190,8 +193,20 @@ static VectorBatch* VectorEngineRun(PlanState* node)
     //         &vec_engine_profile_cpu);
     // }
 
+#ifdef ENABLE_HTAP
+    if (adaptSample)
+        ImcsAdaptBegin(static_cast<IMCStore*>(((IMCStoreScanState*)node)->m_CStore)->GetImcsDesc(), node->instrument, adaptSample);
+#endif
     t_thrd.pgxc_cxt.GlobalNetInstr = node->instrument;
-    result = VectorEngineRunner[GetRunnerIdx(nodeTag(node))](node);
+    PG_TRY();
+    {
+        result = VectorEngineRunner[GetRunnerIdx(nodeTag(node))](node);
+    }
+    PG_CATCH();
+    {
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
 
     // if (unlikely(vec_engine_profile)) {
@@ -247,12 +262,39 @@ static VectorBatch* VectorEngineRun(PlanState* node)
             node->instrument->status = true;
     }
 
+#ifdef ENABLE_HTAP
+    if (adaptSample)
+        ImcsAdaptEnd(adaptSample, node->instrument,
+            static_cast<IMCStore*>(((IMCStoreScanState*)node)->m_CStore)->IsEndScan(), false);
+#endif
     if (old_context) {
         (void)MemoryContextSwitchTo(old_context);
     }
 
     VecCacheTraceLeave(node);
+    RhjTrackLeave(node);
     return result;
+}
+
+static VectorBatch* VectorEngineDispatch(PlanState* node)
+{
+#ifdef ENABLE_HTAP
+    if (unlikely(IsA(node, IMCStoreScanState) &&
+        (u_sess->attr.attr_sql.enable_imcs_nps || u_sess->attr.attr_sql.enable_imcs_adapt))) {
+        volatile ImcsAdaptSample sample = {};
+        VectorBatch* result = NULL;
+        PG_TRY();
+        { result = VectorEngineRun(node, &sample); }
+        PG_CATCH();
+        {
+            ImcsAdaptEnd(&sample, node->instrument, true, true);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        return result;
+    }
+#endif
+    return VectorEngineRun(node);
 }
 
 VectorBatch* VectorEngine(PlanState* node)
@@ -267,7 +309,7 @@ VectorBatch* VectorEngine(PlanState* node)
 
         PG_TRY();
         {
-            result = VectorEngineRun(node);
+            result = VectorEngineDispatch(node);
             OperatorDataAccessLeave(&frame, result);
         }
         PG_CATCH();
@@ -281,7 +323,7 @@ VectorBatch* VectorEngine(PlanState* node)
     }
 #endif
 
-    return VectorEngineRun(node);
+    return VectorEngineDispatch(node);
 }
 // VectorBatch* VectorEngine(PlanState* node)
 // {
@@ -305,6 +347,7 @@ VectorBatch* VectorEngine(PlanState* node)
 //     Assert(node->vectorized);
 
 //     // Track this node from executor setup through instrumentation teardown.
+//     RhjTrackEnter(node);
 //     VecCacheTraceEnter(node);
 
 //     if (node->nodeContext) {

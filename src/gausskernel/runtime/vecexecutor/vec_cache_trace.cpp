@@ -25,12 +25,13 @@
 #include "nodes/plannodes.h"
 #include "threadpool/threadpool_group.h"
 #include "utils/atomic.h"
+#include "vecexecutor/vec_cache_coord.h"
 #include "vecexecutor/vecexecutor.h"
 
 static const char* const CACHE_TRACE_ENV = "OG_CACHE_TRACE";
 static const char* const CACHE_TRACE_INTERVAL_ENV = "OG_CACHE_TRACE_INTERVAL_US";
 
-/* Fixed implementation limits. Only the two environment variables above are user-facing. */
+/* Fixed implementation limits; sampling is enabled by session GUC or environment. */
 enum CacheTraceLimit {
     CACHE_TRACE_DEFAULT_INTERVAL_US = 10000,
     CACHE_TRACE_MIN_INTERVAL_US = 2000,
@@ -45,6 +46,19 @@ enum CacheTraceLimit {
     CACHE_TRACE_STACK_DEPTH = 64,
     CACHE_TRACE_SLOT_ALIGNMENT = 128
 };
+
+static uint64 traceStarted = 0, traceWritten = 0, traceStartFailed = 0;
+static uint64 tracePerfUnavailable = 0, traceWriteFailed = 0, traceDiscarded = 0;
+void VecCacheTraceReadCounters(uint64* started, uint64* written, uint64* startFailed,
+    uint64* perfUnavailable, uint64* writeFailed, uint64* discarded)
+{
+    *started = __atomic_load_n(&traceStarted, __ATOMIC_RELAXED);
+    *written = __atomic_load_n(&traceWritten, __ATOMIC_RELAXED);
+    *startFailed = __atomic_load_n(&traceStartFailed, __ATOMIC_RELAXED);
+    *perfUnavailable = __atomic_load_n(&tracePerfUnavailable, __ATOMIC_RELAXED);
+    *writeFailed = __atomic_load_n(&traceWriteFailed, __ATOMIC_RELAXED);
+    *discarded = __atomic_load_n(&traceDiscarded, __ATOMIC_RELAXED);
+}
 
 enum CacheTraceSlotState {
     CACHE_TRACE_SLOT_FREE = 0,
@@ -62,10 +76,10 @@ enum CacheTraceSamplerState {
 
 enum CacheTraceFormat {
     CACHE_TRACE_BINARY_MAGIC = 0x43545243U,
-    CACHE_TRACE_BINARY_VERSION = 4,
+    CACHE_TRACE_BINARY_VERSION = 5,
     CACHE_TRACE_BINARY_FLAG_INCOMPLETE = 0x01U,
     CACHE_TRACE_BINARY_FLAG_MPKI_AVAILABLE = 0x02U,
-    CACHE_TRACE_BINARY_FLAG_CPU_TIME_AVAILABLE = 0x04U,
+    CACHE_TRACE_BINARY_FLAG_COUNTER_TIME_AVAILABLE = 0x04U,
     CACHE_TRACE_SAMPLE_FLAG_OPERATOR_VALID = 0x01U,
     CACHE_TRACE_SAMPLE_FLAG_PERF_VALID = 0x02U,
     CACHE_TRACE_SAMPLE_FLAG_ADAPTIVE = 0x04U
@@ -87,8 +101,9 @@ static const uint64 CACHE_TRACE_INVALID_PLAN_ID = CACHE_TRACE_PLAN_ID_MASK;
 typedef struct CacheTracePerfGroupRead {
     uint64 nr;
     /* Returned by the existing group read; no additional perf fd or syscall. */
+    uint64 time_enabled;
     uint64 time_running;
-    uint64 values[2];
+    uint64 values[4];
 } CacheTracePerfGroupRead;
 
 typedef struct CacheTracePerf {
@@ -96,7 +111,28 @@ typedef struct CacheTracePerf {
     bool running;
     int instruction_fd;
     int cache_miss_fd;
+    int cycle_fd;
+    int stall_fd;
 } CacheTracePerf;
+
+#ifdef ENABLE_HTAP
+const RhjStreamTimelineConfig* RhjStreamTimeline()
+{
+    if (!u_sess->attr.attr_sql.enable_cache_trace ||
+        u_sess->attr.attr_sql.imcs_rhj_overlap_peer_kind != (int)RhjOverlapPeerKind::StreamCopy)
+        return NULL;
+    static const RhjStreamTimelineConfig config = [] {
+        RhjStreamTimelineConfig parsed = {};
+        const char* spec = gs_getenv_r("OG_RHJ_STREAM_TIMELINE");
+        if (spec == NULL || sscanf(spec, "%d,%d,%d", &parsed.outputStream, &parsed.firstLlc,
+            &parsed.secondLlc) != 3 || parsed.outputStream <= 0 || parsed.firstLlc < 0 ||
+            parsed.secondLlc < 0 || parsed.firstLlc == parsed.secondLlc)
+            return RhjStreamTimelineConfig{};
+        return parsed;
+    }();
+    return config.outputStream == 0 ? NULL : &config;
+}
+#endif
 
 /* One synchronized observation point. Counter values are cumulative. */
 typedef struct CacheTraceSample {
@@ -110,8 +146,16 @@ typedef struct CacheTraceSample {
     int32 depth;
     uint32 flags;
     /* Low 32 bits suffice because adjacent samples are milliseconds apart. */
-    uint32 cpu_running_us;
+    uint32 cpu_running_us; // PMU running time, not worker CPU time.
+    uint64 time_enabled_ns;
+    int32 observed_cpu;
+    uint32 reserved;
 } CacheTraceSample;
+
+struct CacheTraceOpCounter { uint64 key, elapsed_ns, reported_ns; };
+struct CacheTraceOpTime { uint64 time_ns, key, elapsed_ns; };
+static const uint32 CACHE_TRACE_OPS = 128;
+static const uint32 CACHE_TRACE_OP_TIMES = 32768;
 
 typedef struct CacheTraceBinaryHeader {
     uint32 magic;
@@ -133,10 +177,13 @@ typedef struct CacheTraceBinaryHeader {
     uint64 sample_count;
     uint64 dropped_samples;
     uint64 perf_read_errors;
+    uint64 os_tid;
+    uint64 op_time_count;
+    uint64 op_time_dropped;
 } CacheTraceBinaryHeader;
 
-static_assert(sizeof(CacheTraceSample) == 56, "unexpected cache trace sample layout");
-static_assert(sizeof(CacheTraceBinaryHeader) == 104, "unexpected cache trace header layout");
+static_assert(sizeof(CacheTraceSample) == 72, "unexpected cache trace sample layout");
+static_assert(sizeof(CacheTraceBinaryHeader) == 128, "unexpected cache trace header layout");
 
 /*
  * A worker owns the operator state and perf fds. The sampler is the only
@@ -145,7 +192,7 @@ static_assert(sizeof(CacheTraceBinaryHeader) == 104, "unexpected cache trace hea
  */
 typedef struct __attribute__((aligned(CACHE_TRACE_SLOT_ALIGNMENT))) CacheTraceSlot {
     pg_atomic_uint32 state;
-    uint32 reserved_state;
+    uint32 sampler_index;
     pg_atomic_uint64 operator_state;
     volatile int32 current_dop;
     int32 instruction_fd;
@@ -159,7 +206,12 @@ typedef struct __attribute__((aligned(CACHE_TRACE_SLOT_ALIGNMENT))) CacheTraceSl
     uint32 sample_count;
     uint32 dropped_samples;
     uint32 perf_read_errors;
-    uint32 reserved_count;
+    uint32 regular_interval_ticks;
+    uint64 runtime_sequence, runtime_at, os_tid;
+    int32 runtime_active, observed_cpu;
+    uint32 runtime_count, op_time_count, op_time_dropped;
+    CacheTraceOpCounter runtime[CACHE_TRACE_OPS];
+    CacheTraceOpTime* op_times;
 } CacheTraceSlot;
 
 static_assert(sizeof(CacheTraceSlot) % CACHE_TRACE_SLOT_ALIGNMENT == 0, "cache trace slot is not cache-line aligned");
@@ -270,26 +322,27 @@ static uint32 CacheTraceParseInterval(const char* value)
 
 static uint64 CacheTraceGetQueryId(PlanState* node)
 {
+    if (u_sess->debug_query_id) return u_sess->debug_query_id;
     if (node != NULL && node->state != NULL && node->state->es_plannedstmt != NULL) {
         return node->state->es_plannedstmt->queryId;
     }
     return 0;
 }
 
-static int CacheTraceOpenPerfCounter(uint64 config, int group_fd)
+static int CacheTraceOpenPerfCounter(uint64 config, int group_fd, uint32 type = PERF_TYPE_HARDWARE)
 {
 #ifdef __linux__
     struct perf_event_attr event;
     errno_t rc = memset_s(&event, sizeof(event), 0, sizeof(event));
     securec_check(rc, "\0", "\0");
 
-    event.type = PERF_TYPE_HARDWARE;
+    event.type = type;
     event.size = sizeof(struct perf_event_attr);
     event.config = config;
     event.disabled = 1;
     event.exclude_kernel = 1;
     event.exclude_hv = 1;
-    event.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    event.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
     return (int)syscall(__NR_perf_event_open, &event, 0, -1, group_fd, 0);
 #else
     return -1;
@@ -305,6 +358,10 @@ static void CacheTracePerfClose()
     if (cache_trace.perf.cache_miss_fd >= 0) {
         close(cache_trace.perf.cache_miss_fd);
     }
+    if (cache_trace.perf.cycle_fd >= 0)
+        close(cache_trace.perf.cycle_fd);
+    if (cache_trace.perf.stall_fd >= 0)
+        close(cache_trace.perf.stall_fd);
     if (cache_trace.perf.instruction_fd >= 0) {
         close(cache_trace.perf.instruction_fd);
     }
@@ -313,6 +370,8 @@ static void CacheTracePerfClose()
     cache_trace.perf.running = false;
     cache_trace.perf.instruction_fd = -1;
     cache_trace.perf.cache_miss_fd = -1;
+    cache_trace.perf.cycle_fd = -1;
+    cache_trace.perf.stall_fd = -1;
 }
 
 static void CacheTracePerfWarn(const char* message)
@@ -329,6 +388,8 @@ static void CacheTracePerfInit()
     cache_trace.perf.running = false;
     cache_trace.perf.instruction_fd = -1;
     cache_trace.perf.cache_miss_fd = -1;
+    cache_trace.perf.cycle_fd = -1;
+    cache_trace.perf.stall_fd = -1;
 
 #ifdef __linux__
     cache_trace.perf.instruction_fd = CacheTraceOpenPerfCounter(PERF_COUNT_HW_INSTRUCTIONS, -1);
@@ -338,7 +399,8 @@ static void CacheTracePerfInit()
     }
 
     cache_trace.perf.cache_miss_fd =
-        CacheTraceOpenPerfCounter(PERF_COUNT_HW_CACHE_MISSES, cache_trace.perf.instruction_fd);
+        CacheTraceOpenPerfCounter(PERF_COUNT_HW_CACHE_LL | ((uint64)PERF_COUNT_HW_CACHE_OP_READ << 8) |
+            ((uint64)PERF_COUNT_HW_CACHE_RESULT_MISS << 16), cache_trace.perf.instruction_fd, PERF_TYPE_HW_CACHE);
     if (cache_trace.perf.cache_miss_fd < 0) {
         int saved_errno = errno;
         CacheTracePerfClose();
@@ -347,6 +409,21 @@ static void CacheTracePerfInit()
         return;
     }
 
+#ifdef ENABLE_HTAP
+    if (RhjStreamTimeline() != NULL) {
+        int leader = cache_trace.perf.instruction_fd;
+        int cycles = CacheTraceOpenPerfCounter(PERF_COUNT_HW_CPU_CYCLES, leader);
+        int stalls = cycles < 0 ? -1 : CacheTraceOpenPerfCounter(PERF_COUNT_HW_STALLED_CYCLES_BACKEND, leader);
+        if (stalls >= 0) {
+            cache_trace.perf.cycle_fd = cycles;
+            cache_trace.perf.stall_fd = stalls;
+        } else {
+            CacheTracePerfWarn("failed to open probe cycle or backend stall event");
+            if (cycles >= 0)
+                close(cycles);
+        }
+    }
+#endif
     if (ioctl(cache_trace.perf.instruction_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0 ||
         ioctl(cache_trace.perf.instruction_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) {
         int saved_errno = errno;
@@ -362,7 +439,8 @@ static void CacheTracePerfInit()
 }
 
 static bool CacheTracePerfReadFd(
-    int instruction_fd, uint64* instructions, uint64* cache_misses, uint64* cpu_running_ns)
+    int instruction_fd, uint64* instructions, uint64* cache_misses, uint64* cpu_running_ns, uint64* enabled_ns,
+    uint64* cycles = NULL, uint64* stalls = NULL)
 {
 #ifdef __linux__
     CacheTracePerfGroupRead perf_read;
@@ -371,16 +449,31 @@ static bool CacheTracePerfReadFd(
         rc = read(instruction_fd, &perf_read, sizeof(perf_read));
     } while (rc < 0 && errno == EINTR);
 
-    if (rc != (int)sizeof(perf_read) || perf_read.nr < 2) {
+    const int headerBytes = offsetof(CacheTracePerfGroupRead, values);
+    if (rc < headerBytes || (perf_read.nr != 2 && perf_read.nr != 4) ||
+        rc != headerBytes + (int)(perf_read.nr * sizeof(uint64)) ||
+        ((cycles != NULL || stalls != NULL) && perf_read.nr != 4)) {
         return false;
     }
     *instructions = perf_read.values[0];
     *cache_misses = perf_read.values[1];
     *cpu_running_ns = perf_read.time_running;
+    *enabled_ns = perf_read.time_enabled;
+    if (cycles != NULL)
+        *cycles = perf_read.values[2];
+    if (stalls != NULL)
+        *stalls = perf_read.values[3];
     return true;
 #else
     return false;
 #endif
+}
+
+bool VecCacheTraceSnapshot(VecCacheTraceCounters* counters, uint64* cycles, uint64* stalls)
+{
+    return cache_trace.query_active && cache_trace.perf.running &&
+        CacheTracePerfReadFd(cache_trace.perf.instruction_fd, &counters->instructions,
+            &counters->misses, &counters->runningNs, &counters->enabledNs, cycles, stalls);
 }
 
 static uint64 CacheTracePackOperator(uint64 generation, int plan_node_id, int node_tag, int depth)
@@ -416,16 +509,49 @@ static void CacheTraceUnpackOperator(
                      CACHE_TRACE_DEPTH_MASK);
 }
 
-static bool CacheTraceSampleSlot(CacheTraceSlot* slot, bool adaptive)
+static void CacheTraceRecordRuntime(CacheTraceSlot* slot, uint64 now)
 {
-    uint32 expected = CACHE_TRACE_SLOT_ACTIVE;
-    if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CACHE_TRACE_SLOT_SAMPLING)) {
-        return false;
+    uint64 keys[CACHE_TRACE_OPS], elapsed[CACHE_TRACE_OPS];
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        uint64 seq = __atomic_load_n(&slot->runtime_sequence, __ATOMIC_ACQUIRE);
+        if (seq & 1) continue;
+        uint32 count = __atomic_load_n(&slot->runtime_count, __ATOMIC_RELAXED);
+        int active = __atomic_load_n(&slot->runtime_active, __ATOMIC_RELAXED);
+        uint64 at = __atomic_load_n(&slot->runtime_at, __ATOMIC_RELAXED);
+        for (uint32 i = 0; i < count; ++i) {
+            keys[i] = __atomic_load_n(&slot->runtime[i].key, __ATOMIC_RELAXED);
+            elapsed[i] = __atomic_load_n(&slot->runtime[i].elapsed_ns, __ATOMIC_RELAXED);
+            if ((int)i == active && now > at) elapsed[i] += now - at;
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (seq != __atomic_load_n(&slot->runtime_sequence, __ATOMIC_ACQUIRE)) continue;
+        /* A stack transition after the PMU timestamp cannot be reconstructed
+         * at that earlier boundary. Keep the cumulative counters for the next
+         * observation rather than assigning future runtime to this window. */
+        if (at > now) return;
+        /* Preserve a coherent observation boundary even when no operator
+         * counter changed (for example an idle gap). The reserved zero-valued
+         * key emits no operator duration but advances the replay boundary. */
+        if (slot->op_time_count >= CACHE_TRACE_OP_TIMES) { ++slot->op_time_dropped; return; }
+        slot->op_times[slot->op_time_count++] = {now, UINT64_MAX, 0};
+        for (uint32 i = 0; i < count; ++i) {
+            if (elapsed[i] <= slot->runtime[i].reported_ns) continue;
+            if (slot->op_time_count >= CACHE_TRACE_OP_TIMES) { ++slot->op_time_dropped; continue; }
+            slot->op_times[slot->op_time_count++] = {now, keys[i], elapsed[i]};
+            slot->runtime[i].reported_ns = elapsed[i];
+        }
+        return;
     }
+    /* The worker changed its stack during this observation. Its cumulative
+     * counters remain intact; the next coherent snapshot recovers this time.
+     * Only an exhausted record buffer represents lost runtime data. */
+}
 
+/* Caller owns the slot: initializing, sampling, or closing. */
+static bool CacheTraceCollectSample(CacheTraceSlot* slot, bool adaptive)
+{
     if (slot->sample_count >= CACHE_TRACE_SAMPLE_CAPACITY) {
         slot->dropped_samples++;
-        pg_atomic_write_u32(&slot->state, CACHE_TRACE_SLOT_ACTIVE);
         return true;
     }
 
@@ -434,19 +560,21 @@ static bool CacheTraceSampleSlot(CacheTraceSlot* slot, bool adaptive)
     securec_check(rc, "\0", "\0");
 
     uint64 packed_before = __atomic_load_n(&slot->operator_state, __ATOMIC_ACQUIRE);
-    int32 dop = slot->current_dop;
+    int32 dop = __atomic_load_n(&slot->current_dop, __ATOMIC_RELAXED);
     uint64 instructions = 0;
     uint64 cache_misses = 0;
-    uint64 cpu_running_ns = 0;
+    uint64 cpu_running_ns = 0, enabled_ns = 0;
     bool perf_valid = slot->perf_available &&
                       CacheTracePerfReadFd(
-                          slot->instruction_fd, &instructions, &cache_misses, &cpu_running_ns);
+                          slot->instruction_fd, &instructions, &cache_misses, &cpu_running_ns, &enabled_ns);
     uint64 packed_after = __atomic_load_n(&slot->operator_state, __ATOMIC_ACQUIRE);
 
     sample->time_ns = CacheTraceTime();
     sample->instructions = instructions;
     sample->cache_misses = cache_misses;
     sample->cpu_running_us = (uint32)(cpu_running_ns / 1000ULL);
+    sample->time_enabled_ns = enabled_ns;
+    sample->observed_cpu = __atomic_load_n(&slot->observed_cpu, __ATOMIC_RELAXED);
     sample->dop = dop;
     CacheTraceUnpackOperator(packed_after,
         &sample->operator_generation,
@@ -466,8 +594,8 @@ static bool CacheTraceSampleSlot(CacheTraceSlot* slot, bool adaptive)
         sample->flags |= CACHE_TRACE_SAMPLE_FLAG_ADAPTIVE;
     }
 
+    CacheTraceRecordRuntime(slot, sample->time_ns);
     slot->sample_count++;
-    pg_atomic_write_u32(&slot->state, CACHE_TRACE_SLOT_ACTIVE);
     return true;
 }
 
@@ -488,26 +616,29 @@ static uint32 CacheTraceAdaptiveIntervalTicks(uint32 stable_probes, uint32 regul
     return interval_ticks < regular_ticks ? interval_ticks : regular_ticks;
 }
 
-static void CacheTraceProbeSlot(CacheTraceGlobal* global, uint32 index, uint64 tick)
+static void CacheTraceProbeSlot(CacheTraceGlobal* global, uint32 index, uint64 tick, uint32 sampler_index)
 {
     CacheTraceSlot* slot = &global->slots[index];
-    if (pg_atomic_read_u32(&slot->state) != CACHE_TRACE_SLOT_ACTIVE) {
-        return;
-    }
+    uint32 expected = CACHE_TRACE_SLOT_ACTIVE;
+    if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CACHE_TRACE_SLOT_SAMPLING)) return;
+    /* Protect scheduling state as well as sample writes. A bitmap snapshot
+     * from the old NUMA sampler may outlive slot release and reuse. */
+    struct SamplingGuard {
+        CacheTraceSlot* slot;
+        ~SamplingGuard() { pg_atomic_write_u32(&slot->state, CACHE_TRACE_SLOT_ACTIVE); }
+    } guard{slot};
+    if (slot->sampler_index != sampler_index) return;
 
+    uint32 regular_ticks = slot->regular_interval_ticks;
     uint64 activation_id = __atomic_load_n(&slot->thread_start_ns, __ATOMIC_ACQUIRE);
     uint64 packed = __atomic_load_n(&slot->operator_state, __ATOMIC_ACQUIRE);
-    if (pg_atomic_read_u32(&slot->state) != CACHE_TRACE_SLOT_ACTIVE) {
-        return;
-    }
-
     CacheTraceAdaptiveState* adaptive = &global->adaptive[index];
     if (!adaptive->initialized || adaptive->activation_id != activation_id) {
         adaptive->activation_id = activation_id;
         adaptive->last_operator_state = packed;
         adaptive->next_regular_tick = tick;
         adaptive->next_adaptive_tick = tick;
-        adaptive->refill_epoch = tick / global->regular_interval_ticks;
+        adaptive->refill_epoch = tick / regular_ticks;
         adaptive->stable_probes = 0;
         adaptive->fast_tokens = CACHE_TRACE_FAST_TOKEN_CAPACITY;
         adaptive->initialized = true;
@@ -519,7 +650,7 @@ static void CacheTraceProbeSlot(CacheTraceGlobal* global, uint32 index, uint64 t
         adaptive->stable_probes++;
     }
 
-    uint64 refill_epoch = tick / global->regular_interval_ticks;
+    uint64 refill_epoch = tick / regular_ticks;
     if (refill_epoch > adaptive->refill_epoch) {
         uint64 refill = refill_epoch - adaptive->refill_epoch;
         uint64 tokens = (uint64)adaptive->fast_tokens + refill;
@@ -529,9 +660,9 @@ static void CacheTraceProbeSlot(CacheTraceGlobal* global, uint32 index, uint64 t
     }
 
     uint32 adaptive_ticks =
-        CacheTraceAdaptiveIntervalTicks(adaptive->stable_probes, global->regular_interval_ticks);
+        CacheTraceAdaptiveIntervalTicks(adaptive->stable_probes, regular_ticks);
     bool regular_due = tick >= adaptive->next_regular_tick;
-    bool adaptive_due = adaptive_ticks < global->regular_interval_ticks &&
+    bool adaptive_due = adaptive_ticks < regular_ticks &&
                         tick >= adaptive->next_adaptive_tick;
     bool adaptive_sample = false;
 
@@ -545,12 +676,12 @@ static void CacheTraceProbeSlot(CacheTraceGlobal* global, uint32 index, uint64 t
         adaptive_sample = true;
     }
 
-    if (!CacheTraceSampleSlot(slot, adaptive_sample)) {
+    if (!CacheTraceCollectSample(slot, adaptive_sample)) {
         return;
     }
     if (regular_due) {
         adaptive->next_regular_tick =
-            (tick / global->regular_interval_ticks + 1) * global->regular_interval_ticks;
+            (tick / regular_ticks + 1) * regular_ticks;
     } else {
         adaptive->fast_tokens--;
     }
@@ -612,7 +743,7 @@ static void* CacheTraceSamplerMain(void* arg)
                 uint32 bit = (uint32)__builtin_ctz(active);
                 uint32 index = word * 32 + bit;
                 if (index < CACHE_TRACE_MAX_THREADS) {
-                    CacheTraceProbeSlot(global, index, tick);
+                    CacheTraceProbeSlot(global, index, tick, CacheTraceSamplerIndex(sampler->numa_id));
                 }
                 active &= active - 1;
             }
@@ -735,18 +866,29 @@ static void CacheTraceSetSlotActive(
     }
 }
 
+static THR_LOCAL bool cache_trace_env_on = false;
+static THR_LOCAL bool cache_trace_env_interval = false;
+static THR_LOCAL uint64 cache_trace_failed_query = 0;
+
 static bool CacheTraceInit()
 {
     cache_trace.inited = true;
-    cache_trace.enabled = CacheTraceIsEnabledValue(gs_getenv_r(CACHE_TRACE_ENV));
-    cache_trace.interval_us = CacheTraceParseInterval(gs_getenv_r(CACHE_TRACE_INTERVAL_ENV));
+    cache_trace_env_on = CacheTraceIsEnabledValue(gs_getenv_r(CACHE_TRACE_ENV));
+    cache_trace.enabled = cache_trace_env_on || u_sess->attr.attr_sql.enable_cache_trace;
+    const char* interval = gs_getenv_r(CACHE_TRACE_INTERVAL_ENV);
+    cache_trace_env_interval = interval != NULL;
+    cache_trace.interval_us = CacheTraceParseInterval(interval);
     return cache_trace.enabled;
 }
 
 static inline bool CacheTraceEnabled()
 {
-    if (unlikely(!cache_trace.inited)) {
-        return CacheTraceInit();
+    if (unlikely(!cache_trace.inited)) CacheTraceInit();
+    if (!cache_trace.query_active) {
+        cache_trace.enabled = (cache_trace_env_on || u_sess->attr.attr_sql.enable_cache_trace) &&
+            (cache_trace_failed_query == 0 || cache_trace_failed_query != u_sess->debug_query_id);
+        if (cache_trace.enabled && !cache_trace_env_interval)
+            cache_trace.interval_us = u_sess->attr.attr_sql.cache_trace_interval_us;
     }
     return cache_trace.enabled;
 }
@@ -793,7 +935,28 @@ static void CacheTracePublishOperator(const CacheTraceFrame* frame)
         dop = frame->dop;
     }
 
-    cache_trace.slot->current_dop = dop;
+    CacheTraceSlot* slot = cache_trace.slot;
+    uint64 now = CacheTraceTime();
+    __atomic_fetch_add(&slot->runtime_sequence, 1, __ATOMIC_ACQ_REL);
+    int prior = slot->runtime_active;
+    if (prior >= 0 && now >= slot->runtime_at)
+        __atomic_fetch_add(&slot->runtime[prior].elapsed_ns, now - slot->runtime_at, __ATOMIC_RELAXED);
+    int active = -1;
+    if (frame != NULL) {
+        uint64 key = ((uint64)(uint32)plan_node_id << 32) | (uint32)node_tag;
+        uint32 count = slot->runtime_count;
+        for (uint32 i = 0; i < count; ++i) if (slot->runtime[i].key == key) { active = i; break; }
+        if (active < 0 && count < CACHE_TRACE_OPS) {
+            active = count;
+            __atomic_store_n(&slot->runtime[count].key, key, __ATOMIC_RELAXED);
+            __atomic_store_n(&slot->runtime_count, count + 1, __ATOMIC_RELAXED);
+        } else if (active < 0) cache_trace.trace_incomplete = true;
+    }
+    __atomic_store_n(&slot->runtime_active, active, __ATOMIC_RELAXED);
+    __atomic_store_n(&slot->runtime_at, now, __ATOMIC_RELAXED);
+    __atomic_store_n(&slot->observed_cpu, sched_getcpu(), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&slot->runtime_sequence, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&cache_trace.slot->current_dop, dop, __ATOMIC_RELAXED);
     uint64 packed = CacheTracePackOperator(cache_trace.operator_generation, plan_node_id, node_tag, depth);
     __atomic_store_n(&cache_trace.slot->operator_state, packed, __ATOMIC_RELEASE);
 }
@@ -826,7 +989,9 @@ static bool CacheTraceStartQuery(PlanState* node)
 
     CacheTraceSample* samples =
         (CacheTraceSample*)malloc(sizeof(CacheTraceSample) * CACHE_TRACE_SAMPLE_CAPACITY);
-    if (samples == NULL) {
+    CacheTraceOpTime* opTimes = (CacheTraceOpTime*)malloc(sizeof(CacheTraceOpTime) * CACHE_TRACE_OP_TIMES);
+    if (samples == NULL || opTimes == NULL) {
+        free(samples); free(opTimes);
         pg_atomic_write_u32(&slot->state, CACHE_TRACE_SLOT_FREE);
         cache_trace.enabled = false;
         ereport(LOG, (errmsg("CACHE_TRACE disabled: failed to allocate per-thread sample buffer")));
@@ -849,10 +1014,18 @@ static bool CacheTraceStartQuery(PlanState* node)
     cache_trace.suppressed_depth = 0;
     cache_trace.slot = slot;
     CacheTracePerfInit();
+    if (!cache_trace.perf.available) __atomic_fetch_add(&tracePerfUnavailable, 1, __ATOMIC_RELAXED);
 
+    slot->sampler_index = CacheTraceSamplerIndex(cache_trace.numa_id);
     slot->query_id = cache_trace.query_id;
     slot->thread_id = cache_trace.thread_id;
     __atomic_store_n(&slot->thread_start_ns, cache_trace.thread_start_ns, __ATOMIC_RELEASE);
+    slot->runtime_sequence = 0; slot->runtime_at = cache_trace.thread_start_ns;
+    slot->runtime_active = -1; slot->runtime_count = 0; slot->observed_cpu = sched_getcpu();
+    slot->op_times = opTimes; slot->op_time_count = 0; slot->op_time_dropped = 0;
+    slot->os_tid = (uint64)syscall(SYS_gettid);
+    memset(slot->runtime, 0, sizeof(slot->runtime));
+    slot->regular_interval_ticks = (cache_trace.interval_us + CACHE_TRACE_PROBE_INTERVAL_US - 1) / CACHE_TRACE_PROBE_INTERVAL_US;
     slot->samples = samples;
     slot->sample_count = 0;
     slot->dropped_samples = 0;
@@ -864,8 +1037,12 @@ static bool CacheTraceStartQuery(PlanState* node)
     __atomic_store_n(&slot->operator_state,
         CacheTracePackOperator(cache_trace.operator_generation, -1, 0, 0),
         __ATOMIC_RELEASE);
+    /* Boundary reads retain the first and last partial monitoring windows,
+     * including workers whose entire lifetime is shorter than the interval. */
+    CacheTraceCollectSample(slot, false);
     pg_atomic_write_u32(&slot->state, CACHE_TRACE_SLOT_ACTIVE);
     CacheTraceSetSlotActive(global, slot, cache_trace.numa_id, true);
+    __atomic_fetch_add(&traceStarted, 1, __ATOMIC_RELAXED);
     return true;
 }
 
@@ -876,6 +1053,8 @@ void VecCacheTraceEnter(PlanState* node)
     }
 
     if (!cache_trace.query_active && !CacheTraceStartQuery(node)) {
+        __atomic_fetch_add(&traceStartFailed, 1, __ATOMIC_RELAXED);
+        cache_trace_failed_query = u_sess->debug_query_id;
         return;
     }
     if (cache_trace.query_id == 0) {
@@ -1013,12 +1192,12 @@ static bool CacheTraceWriteBinary(char* path, size_t path_size)
     header.version = CACHE_TRACE_BINARY_VERSION;
     header.header_size = sizeof(header);
     header.sample_size = sizeof(CacheTraceSample);
-    header.flags = (cache_trace.trace_incomplete || cache_trace.slot->dropped_samples > 0
+    header.flags = (cache_trace.trace_incomplete || cache_trace.slot->dropped_samples > 0 || cache_trace.slot->op_time_dropped > 0
                         ? CACHE_TRACE_BINARY_FLAG_INCOMPLETE
                         : 0) |
                    (cache_trace.perf.available
                            ? CACHE_TRACE_BINARY_FLAG_MPKI_AVAILABLE |
-                                 CACHE_TRACE_BINARY_FLAG_CPU_TIME_AVAILABLE
+                                 CACHE_TRACE_BINARY_FLAG_COUNTER_TIME_AVAILABLE
                            : 0);
     header.interval_us = cache_trace.interval_us;
     header.stack_errors = cache_trace.stack_errors;
@@ -1034,6 +1213,9 @@ static bool CacheTraceWriteBinary(char* path, size_t path_size)
     header.sample_count = cache_trace.slot->sample_count;
     header.dropped_samples = cache_trace.slot->dropped_samples;
     header.perf_read_errors = cache_trace.slot->perf_read_errors;
+    header.os_tid = cache_trace.slot->os_tid;
+    header.op_time_count = cache_trace.slot->op_time_count;
+    header.op_time_dropped = cache_trace.slot->op_time_dropped;
 
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
@@ -1042,7 +1224,8 @@ static bool CacheTraceWriteBinary(char* path, size_t path_size)
     bool success = CacheTraceWriteAll(fd, &header, sizeof(header)) &&
                    CacheTraceWriteAll(fd,
                        cache_trace.slot->samples,
-                       cache_trace.slot->sample_count * sizeof(CacheTraceSample));
+                       cache_trace.slot->sample_count * sizeof(CacheTraceSample)) &&
+                   CacheTraceWriteAll(fd, cache_trace.slot->op_times, cache_trace.slot->op_time_count * sizeof(CacheTraceOpTime));
     if (close(fd) != 0) {
         success = false;
     }
@@ -1060,7 +1243,16 @@ static void CacheTraceLogAndRelease(bool write_output)
 
     char binary_path[MAXPGPATH];
     binary_path[0] = '\0';
+    if (write_output) {
+        CacheTraceCollectSample(slot, false);
+        cache_trace.thread_end_ns = Max(cache_trace.thread_end_ns, slot->samples[slot->sample_count - 1].time_ns);
+    } else {
+        CacheTraceRecordRuntime(slot, cache_trace.thread_end_ns);
+    }
     bool output_ok = !write_output || CacheTraceWriteBinary(binary_path, sizeof(binary_path));
+    if (!write_output) __atomic_fetch_add(&traceDiscarded, 1, __ATOMIC_RELAXED);
+    else if (output_ok) __atomic_fetch_add(&traceWritten, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_add(&traceWriteFailed, 1, __ATOMIC_RELAXED);
     if (write_output && !output_ok) {
         cache_trace.output_errors++;
         cache_trace.trace_incomplete = true;
@@ -1085,7 +1277,7 @@ static void CacheTraceLogAndRelease(bool write_output)
                     "output_errors=%u incomplete=%d start_ns=" UINT64_FORMAT " end_ns=" UINT64_FORMAT
                     " operator_changes=" UINT64_FORMAT " numa=%d group=%d mpki_available=%d interval_us=%u "
                     "probe_interval_us=%u adaptive_samples=%u sampler_tid=" UINT64_FORMAT
-                    " sampler_numa=%d cpu_time_available=%d binary_ok=%d binary_file=%s format=binary_v4",
+                    " sampler_numa=%d counter_time_available=%d binary_ok=%d binary_file=%s format=binary_v5",
                 cache_trace.thread_id,
                 cache_trace.query_id,
                 slot->sample_count,
@@ -1120,6 +1312,7 @@ static void CacheTraceLogAndRelease(bool write_output)
     }
 
     CacheTracePerfClose();
+    free(slot->op_times); slot->op_times = NULL;
     free(slot->samples);
     slot->samples = NULL;
     slot->sample_count = 0;
@@ -1152,6 +1345,7 @@ static void CacheTraceResetQuery()
 
 void VecCacheTraceFlush()
 {
+    RhjTrackReset();
     if (!cache_trace.inited || !cache_trace.enabled || !cache_trace.query_active) {
         return;
     }
@@ -1167,6 +1361,7 @@ void VecCacheTraceFlush()
 
 void VecCacheTraceDiscard()
 {
+    RhjTrackReset();
     if (!cache_trace.inited || !cache_trace.enabled || !cache_trace.query_active) {
         return;
     }
